@@ -2,6 +2,8 @@
 
 This repository publishes reusable GitHub Actions workflows from `.github/workflows`.
 
+The reusable workflows in this repository are exposed through `on.workflow_call` only. Event triggers such as `pull_request`, `push`, `release`, and `workflow_dispatch` belong in the calling repository's wrapper workflows.
+
 Other repositories can call them by referencing this repository on `main` or on a tag:
 
 ```yaml
@@ -175,6 +177,8 @@ This repository now validates workflow changes with a dedicated CI workflow:
 - `check_workflows.py` enforces reusable-workflow contract rules for this repository, including the current secret policy.
 
 That validation is intentionally static. Full end-to-end execution still needs to happen from a consuming repository, because several reusable workflows depend on caller repository contents, pull request event data, and external secrets.
+
+If you want to exercise a reusable workflow directly during development, create a small wrapper workflow in the caller repository, or add a temporary wrapper in this repository that triggers on the event you want to test and then calls the reusable workflow.
 
 For local validation, this repository also includes a Python devcontainer. Opening the repository in that devcontainer installs the dependencies needed to run:
 

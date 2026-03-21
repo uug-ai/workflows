@@ -1,7 +1,5 @@
 name: Create a new release
 on:
-  release:
-    types: [created]
   workflow_call:
     inputs:
       organization:

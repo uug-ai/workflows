@@ -1,33 +1,5 @@
 name: Create User Story Issue
 on:
-  workflow_dispatch:
-    inputs:
-      issue_title:
-        description: 'Title for the issue'
-        required: true
-      issue_description:
-        description: 'Brief description of the feature'
-        required: true
-      complexity:
-        description: 'Complexity of the feature'
-        required: true
-        type: choice
-        options:
-          - 'Low'
-          - 'Medium'
-          - 'High'
-        default: 'Medium'
-      duration:
-        description: 'Estimated duration'
-        required: true
-        type: choice
-        options:
-          - '1 day'
-          - '3 days'
-          - '1 week'
-          - '2 weeks'
-          - '1 month'
-        default: '1 week'
   workflow_call:
     inputs:
       issue_title:

@@ -1,7 +1,5 @@
 name: Build pull request
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
   workflow_call:
     inputs:
       organization:
