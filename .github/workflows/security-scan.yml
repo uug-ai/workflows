@@ -66,9 +66,9 @@ jobs:
         uses: oras-project/setup-oras@v1
       - name: Download and extract the vulnerability DB
         run: |
-          mkdir -p $GITHUB_WORKSPACE/.cache/trivy/db
+          mkdir -p "$GITHUB_WORKSPACE/.cache/trivy/db"
           oras pull ghcr.io/aquasecurity/trivy-db:2
-          tar -xzf db.tar.gz -C $GITHUB_WORKSPACE/.cache/trivy/db
+          tar -xzf db.tar.gz -C "$GITHUB_WORKSPACE/.cache/trivy/db"
 
       # Install Trivy directly from release artifacts
       - name: Install Trivy

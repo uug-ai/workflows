@@ -136,16 +136,16 @@ jobs:
         run: sleep 10
       - name: Create and push multi-arch manifest
         run: |
-          docker manifest create ghcr.io/$ORGANIZATION/$PROJECT:${{ env.TAG }} \
-            ghcr.io/$ORGANIZATION/$PROJECT-platform:amd64-${{ env.TAG }} \
-            ghcr.io/$ORGANIZATION/$PROJECT-platform:arm64-${{ env.TAG }}
-          docker manifest push ghcr.io/$ORGANIZATION/$PROJECT:${{ env.TAG }}
+          docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:${{ env.TAG }}" \
+            "ghcr.io/$ORGANIZATION/$PROJECT-platform:amd64-${{ env.TAG }}" \
+            "ghcr.io/$ORGANIZATION/$PROJECT-platform:arm64-${{ env.TAG }}"
+          docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:${{ env.TAG }}"
       - name: Create and push latest manifest
         run: |
-          docker manifest create ghcr.io/$ORGANIZATION/$PROJECT:latest \
-            ghcr.io/$ORGANIZATION/$PROJECT-platform:amd64-${{ env.TAG }} \
-            ghcr.io/$ORGANIZATION/$PROJECT-platform:arm64-${{ env.TAG }}
-          docker manifest push ghcr.io/$ORGANIZATION/$PROJECT:latest
+          docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:latest" \
+            "ghcr.io/$ORGANIZATION/$PROJECT-platform:amd64-${{ env.TAG }}" \
+            "ghcr.io/$ORGANIZATION/$PROJECT-platform:arm64-${{ env.TAG }}"
+          docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:latest"
 
   update-gitops:
     runs-on: ubuntu-24.04
