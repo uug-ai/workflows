@@ -1,0 +1,93 @@
+name: Create User Story Issue
+on:
+  workflow_dispatch:
+    inputs:
+      issue_title:
+        description: 'Title for the issue'
+        required: true
+      issue_description:
+        description: 'Brief description of the feature'
+        required: true
+      complexity:
+        description: 'Complexity of the feature'
+        required: true
+        type: choice
+        options:
+          - 'Low'
+          - 'Medium'
+          - 'High'
+        default: 'Medium'
+      duration:
+        description: 'Estimated duration'
+        required: true
+        type: choice
+        options:
+          - '1 day'
+          - '3 days'
+          - '1 week'
+          - '2 weeks'
+          - '1 month'
+        default: '1 week'
+  workflow_call:
+    inputs:
+      issue_title:
+        description: 'Title for the issue'
+        required: true
+        type: string
+      issue_description:
+        description: 'Brief description of the feature'
+        required: true
+        type: string
+      complexity:
+        description: 'Complexity of the feature'
+        required: true
+        type: string
+      duration:
+        description: 'Estimated duration'
+        required: true
+        type: string
+      openai_model:
+        description: 'Model passed to the issue creation action'
+        required: false
+        type: string
+        default: 'gpt-4o'
+      labels:
+        description: 'Comma-separated labels to apply'
+        required: false
+        type: string
+        default: 'user-story,feature'
+      assignees:
+        description: 'Comma-separated assignees'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      AZURE_OPENAI_API_KEY:
+        required: true
+      AZURE_OPENAI_ENDPOINT:
+        required: true
+      AZURE_OPENAI_VERSION:
+        required: true
+      github_token:
+        required: false
+
+jobs:
+  create-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create Issue with User Story
+        uses: cedricve/llm-create-issue-user-story@main
+        with:
+          github_token: ${{ secrets.github_token || github.token }}
+          azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION }}
+          openai_model: ${{ inputs.openai_model || 'gpt-4o' }}
+          issue_title: ${{ inputs.issue_title }}
+          issue_description: ${{ inputs.issue_description }}
+          complexity: ${{ inputs.complexity }}
+          duration: ${{ inputs.duration }}
+          labels: ${{ inputs.labels || 'user-story,feature' }}
+          assignees: ${{ inputs.assignees || github.actor }}

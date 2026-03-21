@@ -1,0 +1,60 @@
+name: Autofill PR description
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: 'Pull request number'
+        required: true
+        type: string
+      pull_request_url:
+        description: 'Externally reachable pull request URL used by the action'
+        required: true
+        type: string
+      overwrite_description:
+        description: 'Whether to overwrite the existing description'
+        required: false
+        type: boolean
+        default: true
+      openai_model:
+        description: 'Model passed to the description action'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      TOKEN:
+        required: true
+      OPENAI_API_KEY:
+        required: false
+      OPENAI_MODEL:
+        required: false
+      AZURE_OPENAI_API_KEY:
+        required: true
+      AZURE_OPENAI_ENDPOINT:
+        required: true
+      AZURE_OPENAI_VERSION:
+        required: true
+
+env:
+  PROJECT: ${{ github.event.repository.name }}
+  PR_NUMBER: ${{ inputs.pr_number || github.event.number }}
+  PULL_REQUEST_URL: ${{ inputs.pull_request_url || format('https://pr{0}.api.kerberos.lol', github.event.number) }}
+  
+jobs:
+  openai-pr-description:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Autofill PR description if empty using OpenAI
+        uses: cedricve/azureopenai-pr-description@master
+        with:
+          github_token: ${{ secrets.TOKEN }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION }}
+          openai_model: ${{ inputs.openai_model || secrets.OPENAI_MODEL }}
+          pull_request_url: ${{ env.PULL_REQUEST_URL }}
+          overwrite_description: ${{ inputs.overwrite_description != false }}

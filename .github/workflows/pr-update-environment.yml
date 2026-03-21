@@ -1,0 +1,149 @@
+name: Update Pull Request environment
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_call:
+    inputs:
+      action:
+        description: 'Pull request action name'
+        required: false
+        type: string
+        default: 'opened'
+      organization:
+        description: 'Container organization or owner'
+        required: false
+        type: string
+        default: 'uug-ai'
+      project:
+        description: 'Project or repository name'
+        required: false
+        type: string
+        default: ''
+      pr_number:
+        description: 'Pull request number'
+        required: true
+        type: string
+      sha:
+        description: 'Commit SHA used for the image tag'
+        required: false
+        type: string
+        default: ''
+      tag:
+        description: 'Container tag to publish'
+        required: false
+        type: string
+        default: ''
+      docker_context:
+        description: 'Docker build context'
+        required: false
+        type: string
+        default: '.'
+      gitops_repo:
+        description: 'GitOps repository in owner/name format'
+        required: false
+        type: string
+        default: 'uug-ai/gitops'
+      gitops_pr_environment:
+        description: 'GitOps environment name for the pull request'
+        required: false
+        type: string
+        default: ''
+      commit_email:
+        description: 'Commit author email'
+        required: false
+        type: string
+        default: 'gitops@uug.ai'
+      commit_name:
+        description: 'Commit author name'
+        required: false
+        type: string
+        default: 'GitOps - UUG.AI'
+      commit_message:
+        description: 'Commit message to use'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      USERNAME:
+        required: true
+      TOKEN:
+        required: true
+
+env:
+  PR_ACTION: ${{ inputs.action || github.event.action }}
+  ORGANIZATION: ${{ inputs.organization || 'uug-ai' }}
+  PROJECT: ${{ inputs.project || github.event.repository.name }}
+  PR_NUMBER: ${{ inputs.pr_number || github.event.number }}
+  SHA: ${{ inputs.sha || github.sha }}
+  TAG: ${{ inputs.tag || format('{0}-pr{1}-{2}', inputs.project || github.event.repository.name, inputs.pr_number || github.event.number, inputs.sha || github.sha) }}
+  DOCKER_CONTEXT: ${{ inputs.docker_context || '.' }}
+  GITOPS_REPO: ${{ inputs.gitops_repo || 'uug-ai/gitops' }}
+  GITOPS_PR_ENVIRONMENT: ${{ inputs.gitops_pr_environment || format('pr{0}', inputs.pr_number || github.event.number) }}
+  COMMIT_EMAIL: ${{ inputs.commit_email || 'gitops@uug.ai' }}
+  COMMIT_NAME: ${{ inputs.commit_name || 'GitOps - UUG.AI' }}
+  COMMIT_MESSAGE: ${{ inputs.commit_message || format('Adapating pull request environment for {0} for pr{1}', inputs.project || github.event.repository.name, inputs.pr_number || github.event.number) }}
+
+jobs:
+  image-build:
+    name: Build container image
+    runs-on: ubuntu-24.04
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - name: Checkout repository
+        uses: actions/checkout@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.USERNAME }}
+          password: ${{ secrets.TOKEN }}
+      - name: Run Build
+        run: |
+          docker build -t ${{env.PROJECT}} \
+          --build-arg project=${{env.PROJECT}} \
+          --build-arg github_username=${{ secrets.USERNAME }} \
+          --build-arg github_token=${{ secrets.TOKEN }} ${{ env.DOCKER_CONTEXT }}
+
+      - name: Build and push Docker image
+        run: |
+          docker tag ${{env.PROJECT}} ghcr.io/${{env.ORGANIZATION}}/${{env.PROJECT}}-pullrequests:${{env.TAG}}
+          docker push ghcr.io/${{env.ORGANIZATION}}/${{env.PROJECT}}-pullrequests:${{env.TAG}}
+
+  format:
+    name: Print Pull Request Info
+    runs-on: ubuntu-24.04
+    needs: image-build
+    steps:
+      # Print out the pull request event type
+      - name: Print out pull request event type
+        run: |
+          echo Pull request event: ${{ env.PR_ACTION }}
+
+  update-pr-environment:
+    name: Update Pull Request environment in GitOps repo
+    runs-on: ubuntu-24.04
+    needs: format
+    steps:
+      # After we build the Docker image, we create a pull request to update the GitOps repository
+      # This will allow us to update the Helm chart with the new Docker image tag.
+
+      - name: Update GitOps Pull Request environment
+        uses: cedricve/gitops-pullrequest-environment@main
+        with:
+          action: ${{ env.PR_ACTION }}
+          github-token: ${{ secrets.TOKEN }}
+          gitops-repo: ${{ env.GITOPS_REPO }}
+          gitops-project: ${{ env.PROJECT }}
+          gitops-pr-environment: ${{ env.GITOPS_PR_ENVIRONMENT }}
+          changes: |
+            {
+              "images[0].newName": "ghcr.io/${{env.ORGANIZATION}}/${{ env.PROJECT }}-pullrequests",
+              "images[0].newTag": "${{ env.TAG }}"
+            }
+          commit-email: ${{ env.COMMIT_EMAIL }}
+          commit-name: ${{ env.COMMIT_NAME }}
+          commit-message: ${{ env.COMMIT_MESSAGE }}

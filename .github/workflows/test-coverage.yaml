@@ -1,0 +1,96 @@
+name: Test Coverage
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  release:
+    types: [created]
+  workflow_call:
+    inputs:
+      organization:
+        description: 'Repository owner or Codecov organization'
+        required: false
+        type: string
+        default: 'uug-ai'
+      project:
+        description: 'Project or repository name'
+        required: false
+        type: string
+        default: ''
+      go_version:
+        description: 'Go version to install'
+        required: false
+        type: string
+        default: '1.25'
+      go_dir:
+        description: 'Directory containing the Go module'
+        required: false
+        type: string
+        default: 'api'
+      go_sum_path:
+        description: 'Path used for Go dependency caching'
+        required: false
+        type: string
+        default: 'api/go.sum'
+      coverage_artifact_name:
+        description: 'Artifact name used for the HTML coverage report'
+        required: false
+        type: string
+        default: 'coverage-report'
+    secrets:
+      USERNAME:
+        required: true
+      TOKEN:
+        required: true
+      CODECOV_TOKEN:
+        required: false
+
+env:
+  ORGANIZATION: ${{ inputs.organization || 'uug-ai' }}
+  PROJECT: ${{ inputs.project || github.event.repository.name }}
+  GO_VERSION: ${{ inputs.go_version || '1.25' }}
+  GO_DIR: ${{ inputs.go_dir || 'api' }}
+  GO_SUM_PATH: ${{ inputs.go_sum_path || 'api/go.sum' }}
+
+jobs:
+  test-coverage:
+    runs-on: ubuntu-latest
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      # Setup Golang for us in the workflow
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: ${{ env.GO_SUM_PATH }}
+      # Test the Golang application
+      - name: Test Golang application
+        run: |
+          cd "${{ env.GO_DIR }}"
+          git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"
+          go fmt $(go list ./... | grep -v /vendor/)
+          go vet $(go list ./... | grep -v /vendor/)
+          go test -race $(go list ./... | grep -v /vendor/)
+      # Print out test coverage
+      - name: Print test coverage
+        run: |
+          cd "${{ env.GO_DIR }}"
+          go test -coverprofile=coverage.out $(go list ./... | grep -v /vendor/)
+          go tool cover -func=coverage.out
+          go tool cover -html=coverage.out -o coverage.html
+      # Upload test coverage report
+      - name: Upload test coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.coverage_artifact_name || 'coverage-report' }}
+          path: ${{ format('{0}/coverage.html', env.GO_DIR) }}
+      # Upload coverage reports to Codecov
+      - name: Upload coverage reports to Codecov
+        if: ${{ secrets.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: ${{ env.ORGANIZATION }}/${{ env.PROJECT }}
+          fail_ci_if_error: false

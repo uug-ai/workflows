@@ -1,0 +1,75 @@
+name: Delete Pull Request environment
+
+on:
+  pull_request:
+    types: [closed]
+  workflow_call:
+    inputs:
+      action:
+        description: 'Pull request action name'
+        required: false
+        type: string
+        default: 'closed'
+      pr_number:
+        description: 'Pull request number'
+        required: true
+        type: string
+      project:
+        description: 'Project or repository name'
+        required: false
+        type: string
+        default: ''
+      gitops_repo:
+        description: 'GitOps repository in owner/name format'
+        required: false
+        type: string
+        default: 'uug-ai/gitops'
+      gitops_pr_environment:
+        description: 'GitOps environment name for the pull request'
+        required: false
+        type: string
+        default: ''
+      commit_email:
+        description: 'Commit author email'
+        required: false
+        type: string
+        default: 'gitops@uug.ai'
+      commit_name:
+        description: 'Commit author name'
+        required: false
+        type: string
+        default: 'GitOps - UUG.AI'
+      commit_message:
+        description: 'Commit message to use'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      TOKEN:
+        required: true
+
+env:
+  PR_ACTION: ${{ inputs.action || github.event.action }}
+  PR_NUMBER: ${{ inputs.pr_number || github.event.number }}
+  PROJECT: ${{ inputs.project || github.event.repository.name }}
+  GITOPS_REPO: ${{ inputs.gitops_repo || 'uug-ai/gitops' }}
+  GITOPS_PR_ENVIRONMENT: ${{ inputs.gitops_pr_environment || format('pr{0}', inputs.pr_number || github.event.number) }}
+  COMMIT_EMAIL: ${{ inputs.commit_email || 'gitops@uug.ai' }}
+  COMMIT_NAME: ${{ inputs.commit_name || 'GitOps - UUG.AI' }}
+  COMMIT_MESSAGE: ${{ inputs.commit_message || format('Deleting pull request environment for {0} for pr{1}', inputs.project || github.event.repository.name, inputs.pr_number || github.event.number) }}
+  
+jobs:
+  update-gitops-environment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update GitOps Pull Request environment
+        uses: cedricve/gitops-pullrequest-environment@main
+        with:
+          action: ${{ env.PR_ACTION }}
+          github-token: ${{ secrets.TOKEN }}
+          gitops-repo: ${{ env.GITOPS_REPO }}
+          gitops-project: ${{ env.PROJECT }}
+          gitops-pr-environment: ${{ env.GITOPS_PR_ENVIRONMENT }}
+          commit-email: ${{ env.COMMIT_EMAIL }}
+          commit-name: ${{ env.COMMIT_NAME }}
+          commit-message: ${{ env.COMMIT_MESSAGE }}

@@ -1,0 +1,167 @@
+name: Create a new release
+on:
+  release:
+    types: [created]
+  workflow_call:
+    inputs:
+      organization:
+        description: 'Container organization or owner'
+        required: false
+        type: string
+        default: 'uug-ai'
+      project:
+        description: 'Project or repository name'
+        required: false
+        type: string
+        default: ''
+      tag:
+        description: 'Release tag to build and publish'
+        required: false
+        type: string
+        default: ''
+      docker_context:
+        description: 'Docker build context'
+        required: false
+        type: string
+        default: '.'
+      runner_matrix:
+        description: 'JSON array of objects with architecture and runner keys'
+        required: false
+        type: string
+        default: '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]'
+      gitops_repo:
+        description: 'GitOps repository in owner/name format'
+        required: false
+        type: string
+        default: 'uug-ai/gitops'
+      gitops_file:
+        description: 'GitOps file path to update'
+        required: false
+        type: string
+        default: 'environments/staging/kerberos-hub/values.yaml'
+      gitops_key:
+        description: 'GitOps key path to update'
+        required: false
+        type: string
+        default: 'kerberoshub.api.tag'
+      gitops_value:
+        description: 'GitOps value to set; defaults to the release tag'
+        required: false
+        type: string
+        default: ''
+      gitops_pr_branch:
+        description: 'GitOps pull request branch name'
+        required: false
+        type: string
+        default: ''
+      commit_email:
+        description: 'Commit author email'
+        required: false
+        type: string
+        default: 'gitops@uug.ai'
+      commit_name:
+        description: 'Commit author name'
+        required: false
+        type: string
+        default: 'GitOps - UUG.AI'
+      commit_message:
+        description: 'Commit message to use'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      USERNAME:
+        required: true
+      TOKEN:
+        required: true
+
+env:
+  ORGANIZATION: ${{ inputs.organization || 'uug-ai' }}
+  PROJECT: ${{ inputs.project || github.event.repository.name }}
+  TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  DOCKER_CONTEXT: ${{ inputs.docker_context || '.' }}
+  GITOPS_REPO: ${{ inputs.gitops_repo || 'uug-ai/gitops' }}
+  GITOPS_FILE: ${{ inputs.gitops_file || 'environments/staging/kerberos-hub/values.yaml' }}
+  GITOPS_KEY: ${{ inputs.gitops_key || 'kerberoshub.api.tag' }}
+  GITOPS_VALUE: ${{ inputs.gitops_value || inputs.tag || github.event.release.tag_name || github.ref_name }}
+  GITOPS_PR_BRANCH: ${{ inputs.gitops_pr_branch || format('release-{0}-{1}', inputs.project || github.event.repository.name, inputs.tag || github.event.release.tag_name || github.ref_name) }}
+  COMMIT_EMAIL: ${{ inputs.commit_email || 'gitops@uug.ai' }}
+  COMMIT_NAME: ${{ inputs.commit_name || 'GitOps - UUG.AI' }}
+  COMMIT_MESSAGE: ${{ inputs.commit_message || format('A new release for {0} - {1}', inputs.project || github.event.repository.name, inputs.tag || github.event.release.tag_name || github.ref_name) }}
+
+jobs:
+
+  build:
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+      packages: write
+    strategy:
+      matrix:
+        include: ${{ fromJson(inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.USERNAME }}
+          password: ${{ secrets.TOKEN }}
+      - name: Run Build
+        run: |
+          docker build --provenance=false -t ${{matrix.architecture}} \
+          --build-arg project=${{ env.PROJECT }} \
+          --build-arg github_username=${{ secrets.USERNAME }} \
+          --build-arg github_token=${{ secrets.TOKEN }} ${{ env.DOCKER_CONTEXT }}
+
+      - name: Build and push Docker image
+        run: |
+          docker tag ${{matrix.architecture}} ghcr.io/$ORGANIZATION/$PROJECT-platform:${{matrix.architecture}}-${{ env.TAG }}
+          docker push ghcr.io/$ORGANIZATION/$PROJECT-platform:${{matrix.architecture}}-${{ env.TAG }}
+
+  create-manifest:
+    runs-on: ubuntu-24.04
+    needs: [build]
+    permissions:
+      packages: write
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.USERNAME }}
+          password: ${{ secrets.TOKEN }}
+      - name: Wait for image propagation
+        run: sleep 10
+      - name: Create and push multi-arch manifest
+        run: |
+          docker manifest create ghcr.io/$ORGANIZATION/$PROJECT:${{ env.TAG }} \
+            ghcr.io/$ORGANIZATION/$PROJECT-platform:amd64-${{ env.TAG }} \
+            ghcr.io/$ORGANIZATION/$PROJECT-platform:arm64-${{ env.TAG }}
+          docker manifest push ghcr.io/$ORGANIZATION/$PROJECT:${{ env.TAG }}
+      - name: Create and push latest manifest
+        run: |
+          docker manifest create ghcr.io/$ORGANIZATION/$PROJECT:latest \
+            ghcr.io/$ORGANIZATION/$PROJECT-platform:amd64-${{ env.TAG }} \
+            ghcr.io/$ORGANIZATION/$PROJECT-platform:arm64-${{ env.TAG }}
+          docker manifest push ghcr.io/$ORGANIZATION/$PROJECT:latest
+
+  update-gitops:
+    runs-on: ubuntu-24.04
+    needs: [create-manifest]
+    steps:
+      # After we build the Docker image, we create a pull request to update the GitOps repository
+      # This will allow us to update the Helm chart with the new Docker image tag.
+      - name: Create GitOps Pull Request
+        uses: cedricve/gitops-pullrequest-action@master
+        with:
+          github-token: ${{ secrets.TOKEN }}
+          gitops-repo: "${{ env.GITOPS_REPO }}"
+          gitops-file: "${{ env.GITOPS_FILE }}"
+          gitops-pr-branch: "${{ env.GITOPS_PR_BRANCH }}"
+          gitops-key: "${{ env.GITOPS_KEY }}"
+          gitops-value: "${{ env.GITOPS_VALUE }}"
+          commit-email: "${{ env.COMMIT_EMAIL }}"
+          commit-name: "${{ env.COMMIT_NAME }}"
+          commit-message: "${{ env.COMMIT_MESSAGE }}"
