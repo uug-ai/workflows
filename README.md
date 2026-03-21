@@ -111,11 +111,16 @@ jobs:
     with:
       project: ${{ github.event.repository.name }}
       tag: ${{ github.event.release.tag_name }}
+      create_gitops_pr: true
       gitops_repo: uug-ai/gitops
       gitops_file: environments/staging/my-service/values.yaml
       gitops_key: image.tag
     secrets: inherit
 ```
+
+Set `create_gitops_pr: false` if you only want to publish images and manifests without opening a GitOps pull request.
+
+`release-create.yml` builds one image per entry in `runner_matrix` and then creates the published manifests from the `architecture` values in that matrix, so the manifest contents stay aligned with the configured build targets.
 
 ## Manual workflow example
 

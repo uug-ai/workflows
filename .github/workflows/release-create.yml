@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]'
+      create_gitops_pr:
+        description: 'Whether to create a GitOps pull request after publishing images'
+        required: false
+        type: boolean
+        default: true
       gitops_repo:
         description: 'GitOps repository in owner/name format'
         required: false
@@ -78,6 +83,7 @@ env:
   PROJECT: ${{ inputs.project || github.event.repository.name }}
   TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
   DOCKER_CONTEXT: ${{ inputs.docker_context || '.' }}
+  RUNNER_MATRIX: ${{ inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]' }}
   GITOPS_REPO: ${{ inputs.gitops_repo || 'uug-ai/gitops' }}
   GITOPS_FILE: ${{ inputs.gitops_file || 'environments/staging/kerberos-hub/values.yaml' }}
   GITOPS_KEY: ${{ inputs.gitops_key || 'kerberoshub.api.tag' }}
@@ -132,22 +138,29 @@ jobs:
           password: ${{ secrets.TOKEN }}
       - name: Wait for image propagation
         run: sleep 10
-      - name: Create and push multi-arch manifest
+      - name: Create and push manifests
+        shell: bash
         run: |
-          docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:${{ env.TAG }}" \
-            "ghcr.io/$ORGANIZATION/$PROJECT-platform:amd64-${{ env.TAG }}" \
-            "ghcr.io/$ORGANIZATION/$PROJECT-platform:arm64-${{ env.TAG }}"
-          docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:${{ env.TAG }}"
-      - name: Create and push latest manifest
-        run: |
-          docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:latest" \
-            "ghcr.io/$ORGANIZATION/$PROJECT-platform:amd64-${{ env.TAG }}" \
-            "ghcr.io/$ORGANIZATION/$PROJECT-platform:arm64-${{ env.TAG }}"
+          mapfile -t image_refs < <(python3 - <<'PY'
+          import json
+          import os
+
+          matrix = json.loads(os.environ["RUNNER_MATRIX"])
+          for entry in matrix:
+              print(f'ghcr.io/{os.environ["ORGANIZATION"]}/{os.environ["PROJECT"]}-platform:{entry["architecture"]}-{os.environ["TAG"]}')
+          PY
+          )
+
+          docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:$TAG" "${image_refs[@]}"
+          docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:$TAG"
+
+          docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:latest" "${image_refs[@]}"
           docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:latest"
 
   update-gitops:
     runs-on: ubuntu-24.04
     needs: [create-manifest]
+    if: ${{ inputs.create_gitops_pr }}
     steps:
       # After we build the Docker image, we create a pull request to update the GitOps repository
       # This will allow us to update the Helm chart with the new Docker image tag.
