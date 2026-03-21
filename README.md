@@ -156,10 +156,28 @@ These reusable workflows expect the consuming repository to provide the same sec
 - `TOKEN`
 - `USERNAME`
 - `CODECOV_TOKEN`
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL`
 - `AZURE_OPENAI_API_KEY`
+
+Non-secret Azure OpenAI settings should be provided as repository variables or workflow inputs:
+
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_VERSION`
 
+The reusable workflows no longer require a direct OpenAI API key.
+
 `issue-userstory-create.yml` can use the built-in GitHub token automatically, or an explicit `github_token` secret if you want to override it.
+
+## Testing
+
+This repository now validates workflow changes with a dedicated CI workflow:
+
+- `actionlint` checks GitHub Actions syntax and common authoring mistakes.
+- `check_workflows.py` enforces reusable-workflow contract rules for this repository, including the current secret policy.
+
+That validation is intentionally static. Full end-to-end execution still needs to happen from a consuming repository, because several reusable workflows depend on caller repository contents, pull request event data, and external secrets.
+
+For local validation, this repository also includes a Python devcontainer. Opening the repository in that devcontainer installs the dependencies needed to run:
+
+```bash
+python check_workflows.py
+```
