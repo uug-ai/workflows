@@ -165,7 +165,7 @@ These reusable workflows expect the consuming repository to provide the same sec
 - `CODECOV_TOKEN`
 - `AZURE_OPENAI_API_KEY`
 
-Non-secret Azure OpenAI settings should be provided as repository variables or workflow inputs:
+Azure OpenAI endpoint/version can be provided as inherited secrets or repository variables:
 
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_VERSION`

@@ -23,16 +23,6 @@ on:
         required: false
         type: string
         default: 'gpt-4o'
-      azure_openai_endpoint:
-        description: 'Azure OpenAI endpoint'
-        required: false
-        type: string
-        default: ''
-      azure_openai_version:
-        description: 'Azure OpenAI API version'
-        required: false
-        type: string
-        default: ''
       labels:
         description: 'Comma-separated labels to apply'
         required: false
@@ -46,6 +36,10 @@ on:
     secrets:
       AZURE_OPENAI_API_KEY:
         required: true
+      AZURE_OPENAI_ENDPOINT:
+        required: false
+      AZURE_OPENAI_VERSION:
+        required: false
       github_token:
         required: false
 
@@ -60,8 +54,8 @@ jobs:
         with:
           github_token: ${{ secrets.github_token || github.token }}
           azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          azure_openai_endpoint: ${{ inputs.azure_openai_endpoint || vars.AZURE_OPENAI_ENDPOINT }}
-          azure_openai_version: ${{ inputs.azure_openai_version || vars.AZURE_OPENAI_VERSION }}
+          azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT || vars.AZURE_OPENAI_ENDPOINT }}
+          azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION || vars.AZURE_OPENAI_VERSION }}
           openai_model: ${{ inputs.openai_model || 'gpt-4o' }}
           issue_title: ${{ inputs.issue_title }}
           issue_description: ${{ inputs.issue_description }}

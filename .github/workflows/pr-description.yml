@@ -21,21 +21,15 @@ on:
         required: false
         type: string
         default: 'gpt-4o'
-      azure_openai_endpoint:
-        description: 'Azure OpenAI endpoint'
-        required: false
-        type: string
-        default: ''
-      azure_openai_version:
-        description: 'Azure OpenAI API version'
-        required: false
-        type: string
-        default: ''
     secrets:
       TOKEN:
         required: true
       AZURE_OPENAI_API_KEY:
         required: true
+      AZURE_OPENAI_ENDPOINT:
+        required: false
+      AZURE_OPENAI_VERSION:
+        required: false
 
 env:
   PROJECT: ${{ github.event.repository.name }}
@@ -53,8 +47,8 @@ jobs:
         with:
           github_token: ${{ secrets.TOKEN }}
           azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          azure_openai_endpoint: ${{ inputs.azure_openai_endpoint || vars.AZURE_OPENAI_ENDPOINT }}
-          azure_openai_version: ${{ inputs.azure_openai_version || vars.AZURE_OPENAI_VERSION }}
+          azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT || vars.AZURE_OPENAI_ENDPOINT }}
+          azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION || vars.AZURE_OPENAI_VERSION }}
           openai_model: ${{ inputs.openai_model || 'gpt-4o' }}
           pull_request_url: ${{ env.PULL_REQUEST_URL }}
           overwrite_description: ${{ inputs.overwrite_description != false }}
