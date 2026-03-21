@@ -91,27 +91,27 @@ jobs:
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ secrets.USERNAME }}
           password: ${{ secrets.TOKEN }}
       - name: Run Build
         run: |
-          docker build -t ${{env.PROJECT}} \
-          --build-arg project=${{env.PROJECT}} \
-          --build-arg github_username=${{ secrets.USERNAME }} \
-          --build-arg github_token=${{ secrets.TOKEN }} ${{ env.DOCKER_CONTEXT }}
+          docker build -t "${{ env.PROJECT }}" \
+          --build-arg "project=${{ env.PROJECT }}" \
+          --build-arg "github_username=${{ secrets.USERNAME }}" \
+          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.DOCKER_CONTEXT }}"
 
       - name: Build and push Docker image
         run: |
-          docker tag ${{env.PROJECT}} ghcr.io/${{env.ORGANIZATION}}/${{env.PROJECT}}-pullrequests:${{env.TAG}}
-          docker push ghcr.io/${{env.ORGANIZATION}}/${{env.PROJECT}}-pullrequests:${{env.TAG}}
+          docker tag "${{ env.PROJECT }}" "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-pullrequests:${{ env.TAG }}"
+          docker push "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-pullrequests:${{ env.TAG }}"
 
   format:
     name: Print Pull Request Info

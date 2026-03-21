@@ -55,6 +55,8 @@ env:
 jobs:
   test-coverage:
     runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - name: Checkout repository
@@ -67,17 +69,21 @@ jobs:
           cache-dependency-path: ${{ env.GO_SUM_PATH }}
       # Test the Golang application
       - name: Test Golang application
+        shell: bash
         run: |
           cd "${{ env.GO_DIR }}"
           git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"
-          go fmt $(go list ./... | grep -v /vendor/)
-          go vet $(go list ./... | grep -v /vendor/)
-          go test -race $(go list ./... | grep -v /vendor/)
+          mapfile -t packages < <(go list ./... | grep -v /vendor/)
+          go fmt "${packages[@]}"
+          go vet "${packages[@]}"
+          go test -race "${packages[@]}"
       # Print out test coverage
       - name: Print test coverage
+        shell: bash
         run: |
           cd "${{ env.GO_DIR }}"
-          go test -coverprofile=coverage.out $(go list ./... | grep -v /vendor/)
+          mapfile -t packages < <(go list ./... | grep -v /vendor/)
+          go test -coverprofile=coverage.out "${packages[@]}"
           go tool cover -func=coverage.out
           go tool cover -html=coverage.out -o coverage.html
       # Upload test coverage report
@@ -88,9 +94,9 @@ jobs:
           path: ${{ format('{0}/coverage.html', env.GO_DIR) }}
       # Upload coverage reports to Codecov
       - name: Upload coverage reports to Codecov
-        if: ${{ secrets.CODECOV_TOKEN != '' }}
+        if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v5
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ env.CODECOV_TOKEN }}
           slug: ${{ env.ORGANIZATION }}/${{ env.PROJECT }}
           fail_ci_if_error: false

@@ -47,18 +47,18 @@ jobs:
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - name: Checkout repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@v3
 
       # Build the Docker image with the latest tag and the release tag
       # Build the Docker image with the latest tag and the release tag
       - name: Build Docker image with PR tag
         run: |
-          docker build -t ${{ env.PROJECT }} \
-          --build-arg project=${{ env.PROJECT }} \
-          --build-arg github_username=${{ secrets.USERNAME }} \
-          --build-arg github_token=${{ secrets.TOKEN }} ${{ env.DOCKER_CONTEXT }}
+          docker build -t "${{ env.PROJECT }}" \
+          --build-arg "project=${{ env.PROJECT }}" \
+          --build-arg "github_username=${{ secrets.USERNAME }}" \
+          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.DOCKER_CONTEXT }}"
 
       # This is a workaround for the issue with the Trivy DBs not being available due to
       # rate limiting. The workaround is to download the DBs and cache them.

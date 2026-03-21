@@ -65,7 +65,7 @@ jobs:
         include: ${{ fromJson(inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]') }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "${{ env.GO_VERSION }}"
@@ -73,12 +73,14 @@ jobs:
           cache-dependency-path: ${{ env.GO_SUM_PATH }}
       # Test the Golang application
       - name: Test Golang application
+        shell: bash
         run: |
           cd "${{ env.GO_DIR }}"
           git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"
-          go fmt $(go list ./... | grep -v /vendor/)
-          go vet $(go list ./... | grep -v /vendor/)
-          go test -race $(go list ./... | grep -v /vendor/)
+          mapfile -t packages < <(go list ./... | grep -v /vendor/)
+          go fmt "${packages[@]}"
+          go vet "${packages[@]}"
+          go test -race "${packages[@]}"
       # Build the Golang application to the dist folder
       - name: Build Golang application
         run: |
@@ -86,14 +88,14 @@ jobs:
           git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"
           go build -o main
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ secrets.USERNAME }}
           password: ${{ secrets.TOKEN }}
       - name: Run Build
         run: |
-          docker build -t ${{matrix.architecture}} \
-          --build-arg project=${{ env.PROJECT }} \
-          --build-arg github_username=${{ secrets.USERNAME }} \
-          --build-arg github_token=${{ secrets.TOKEN }} ${{ env.DOCKER_CONTEXT }}
+          docker build -t "${{ matrix.architecture }}" \
+          --build-arg "project=${{ env.PROJECT }}" \
+          --build-arg "github_username=${{ secrets.USERNAME }}" \
+          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.DOCKER_CONTEXT }}"

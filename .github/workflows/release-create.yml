@@ -101,24 +101,24 @@ jobs:
         include: ${{ fromJson(inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]') }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ secrets.USERNAME }}
           password: ${{ secrets.TOKEN }}
       - name: Run Build
         run: |
-          docker build --provenance=false -t ${{matrix.architecture}} \
-          --build-arg project=${{ env.PROJECT }} \
-          --build-arg github_username=${{ secrets.USERNAME }} \
-          --build-arg github_token=${{ secrets.TOKEN }} ${{ env.DOCKER_CONTEXT }}
+          docker build --provenance=false -t "${{ matrix.architecture }}" \
+          --build-arg "project=${{ env.PROJECT }}" \
+          --build-arg "github_username=${{ secrets.USERNAME }}" \
+          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.DOCKER_CONTEXT }}"
 
       - name: Build and push Docker image
         run: |
-          docker tag ${{matrix.architecture}} ghcr.io/$ORGANIZATION/$PROJECT-platform:${{matrix.architecture}}-${{ env.TAG }}
-          docker push ghcr.io/$ORGANIZATION/$PROJECT-platform:${{matrix.architecture}}-${{ env.TAG }}
+          docker tag "${{ matrix.architecture }}" "ghcr.io/$ORGANIZATION/$PROJECT-platform:${{ matrix.architecture }}-${{ env.TAG }}"
+          docker push "ghcr.io/$ORGANIZATION/$PROJECT-platform:${{ matrix.architecture }}-${{ env.TAG }}"
 
   create-manifest:
     runs-on: ubuntu-24.04
@@ -127,7 +127,7 @@ jobs:
       packages: write
     steps:
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ secrets.USERNAME }}
