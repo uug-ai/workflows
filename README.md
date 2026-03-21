@@ -185,8 +185,7 @@ That validation is intentionally static. Full end-to-end execution still needs t
 
 If you want to exercise a reusable workflow directly during development, create a small wrapper workflow in the caller repository, or add a temporary wrapper in this repository that triggers on the event you want to test and then calls the reusable workflow.
 
-For local validation, this repository also includes a Python devcontainer. Opening the repository in that devcontainer installs the dependencies needed to run:
-
 ```bash
 python check_workflows.py
 ```
+
