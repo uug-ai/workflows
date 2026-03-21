@@ -18,11 +18,6 @@ on:
         description: 'Estimated duration'
         required: true
         type: string
-      openai_model:
-        description: 'Model passed to the issue creation action'
-        required: false
-        type: string
-        default: 'gpt-4o'
       labels:
         description: 'Comma-separated labels to apply'
         required: false
@@ -36,6 +31,8 @@ on:
     secrets:
       AZURE_OPENAI_API_KEY:
         required: true
+      OPENAI_MODEL:
+        required: false
       AZURE_OPENAI_ENDPOINT:
         required: false
       AZURE_OPENAI_VERSION:
@@ -56,7 +53,7 @@ jobs:
           azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT || vars.AZURE_OPENAI_ENDPOINT }}
           azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION || vars.AZURE_OPENAI_VERSION }}
-          openai_model: ${{ inputs.openai_model || 'gpt-4o' }}
+          openai_model: ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL || 'gpt-4o' }}
           issue_title: ${{ inputs.issue_title }}
           issue_description: ${{ inputs.issue_description }}
           complexity: ${{ inputs.complexity }}

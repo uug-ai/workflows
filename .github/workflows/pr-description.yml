@@ -16,16 +16,13 @@ on:
         required: false
         type: boolean
         default: true
-      openai_model:
-        description: 'Model passed to the description action'
-        required: false
-        type: string
-        default: 'gpt-4o'
     secrets:
       TOKEN:
         required: true
       AZURE_OPENAI_API_KEY:
         required: true
+      OPENAI_MODEL:
+        required: false
       AZURE_OPENAI_ENDPOINT:
         required: false
       AZURE_OPENAI_VERSION:
@@ -49,6 +46,6 @@ jobs:
           azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT || vars.AZURE_OPENAI_ENDPOINT }}
           azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION || vars.AZURE_OPENAI_VERSION }}
-          openai_model: ${{ inputs.openai_model || 'gpt-4o' }}
+          openai_model: ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL || 'gpt-4o' }}
           pull_request_url: ${{ env.PULL_REQUEST_URL }}
           overwrite_description: ${{ inputs.overwrite_description != false }}
