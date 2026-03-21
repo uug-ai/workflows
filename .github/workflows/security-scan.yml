@@ -31,7 +31,7 @@ on:
 
 env:
   PROJECT: ${{ inputs.project || github.event.repository.name }}
-  DOCKER_CONTEXT: ${{ inputs.docker_context || '.' }}
+  BUILD_CONTEXT: ${{ inputs.docker_context || '.' }}
 
 jobs:
   security-scan:
@@ -53,7 +53,7 @@ jobs:
           docker build -t "${{ env.PROJECT }}" \
           --build-arg "project=${{ env.PROJECT }}" \
           --build-arg "github_username=${{ secrets.USERNAME }}" \
-          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.DOCKER_CONTEXT }}"
+          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.BUILD_CONTEXT }}"
 
       # This is a workaround for the issue with the Trivy DBs not being available due to
       # rate limiting. The workaround is to download the DBs and cache them.

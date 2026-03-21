@@ -49,7 +49,7 @@ env:
   GO_VERSION: ${{ inputs.go_version || '1.25' }}
   GO_DIR: ${{ inputs.go_dir || 'api' }}
   GO_SUM_PATH: ${{ inputs.go_sum_path || 'api/go.sum' }}
-  DOCKER_CONTEXT: ${{ inputs.docker_context || '.' }}
+  BUILD_CONTEXT: ${{ inputs.docker_context || '.' }}
 
 jobs:
 
@@ -96,4 +96,4 @@ jobs:
           docker build -t "${{ matrix.architecture }}" \
           --build-arg "project=${{ env.PROJECT }}" \
           --build-arg "github_username=${{ secrets.USERNAME }}" \
-          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.DOCKER_CONTEXT }}"
+          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.BUILD_CONTEXT }}"
