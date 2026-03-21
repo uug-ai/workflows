@@ -13,8 +13,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Download actionlint
+        run: bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+        shell: bash
       - name: Run actionlint
-        uses: rhysd/actionlint@v1
+        run: ./actionlint -color
 
   reusable-contracts:
     runs-on: ubuntu-latest

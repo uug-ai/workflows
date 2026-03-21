@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import sys
 
 import yaml
@@ -27,9 +28,10 @@ class ActionLoader(yaml.SafeLoader):
 def construct_mapping(loader, node, deep=False):
     mapping = {}
     for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        if key == "on":
+        if isinstance(key_node, yaml.ScalarNode) and key_node.value == "on":
             key = "on"
+        else:
+            key = loader.construct_object(key_node, deep=deep)
         value = loader.construct_object(value_node, deep=deep)
         mapping[key] = value
     return mapping
@@ -79,7 +81,8 @@ def validate_workflow(path: Path, errors: list[str]) -> None:
 def validate_readme(errors: list[str]) -> None:
     readme_text = README.read_text(encoding="utf-8")
     for secret_name in sorted(FORBIDDEN_SECRETS):
-        if secret_name in readme_text:
+        pattern = rf"(?<![A-Z0-9_]){re.escape(secret_name)}(?![A-Z0-9_])"
+        if re.search(pattern, readme_text):
             errors.append(f"README.md: forbidden secret still documented: {secret_name}")
 
 
