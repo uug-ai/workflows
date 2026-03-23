@@ -9,7 +9,8 @@ on:
         type: string
       pull_request_url:
         description: 'Externally reachable pull request URL used by the action'
-        required: true
+        required: false
+        default: '__AUTO_GENERATE_PR_URL__'
         type: string
       overwrite_description:
         description: 'Whether to overwrite the existing description'
@@ -31,7 +32,7 @@ on:
 env:
   PROJECT: ${{ github.event.repository.name }}
   PR_NUMBER: ${{ inputs.pr_number || github.event.number }}
-  PULL_REQUEST_URL: ${{ inputs.pull_request_url || format('https://pr{0}.api.kerberos.lol', github.event.number) }}
+  PULL_REQUEST_URL: ${{ inputs.pull_request_url == '__AUTO_GENERATE_PR_URL__' && format('https://pr{0}.api.kerberos.lol', github.event.number) || inputs.pull_request_url }}
   
 jobs:
   openai-pr-description:
