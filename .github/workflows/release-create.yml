@@ -101,6 +101,16 @@ jobs:
       matrix:
         include: ${{ fromJson(inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]') }}
     steps:
+      - name: Provision Node 20 for self-hosted runner
+        if: ${{ !startsWith(matrix.runner, 'ubuntu-') }}
+        run: |
+          if [[ ! -x "$HOME/externals/node20/bin/node" ]]; then
+            ARCH=$(uname -m)
+            [[ "$ARCH" == "aarch64" ]] && ARCH="arm64" || ARCH="x64"
+            mkdir -p "$HOME/externals/node20"
+            curl -fsSL "https://nodejs.org/dist/v20.18.1/node-v20.18.1-linux-${ARCH}.tar.xz" \
+              | tar -xJ --strip-components=1 -C "$HOME/externals/node20"
+          fi
       - name: Checkout
         uses: actions/checkout@v4
       - name: Log in to GitHub Container Registry
