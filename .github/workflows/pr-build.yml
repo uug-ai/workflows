@@ -12,18 +12,23 @@ on:
         required: false
         type: string
         default: ''
+      language:
+        description: 'Application language used by the workflow'
+        required: false
+        type: string
+        default: 'go'
       go_version:
-        description: 'Go version to install'
+        description: 'Go version to install when language is go'
         required: false
         type: string
         default: '1.25'
       go_dir:
-        description: 'Directory containing the Go module'
+        description: 'Directory containing the Go module when language is go'
         required: false
         type: string
         default: 'api'
       go_sum_path:
-        description: 'Path used for Go dependency caching'
+        description: 'Path used for Go dependency caching when language is go'
         required: false
         type: string
         default: 'api/go.sum'
@@ -46,6 +51,7 @@ on:
 env:
   ORGANIZATION: ${{ inputs.organization || 'uug-ai' }}
   PROJECT: ${{ inputs.project || github.event.repository.name }}
+  LANGUAGE: ${{ inputs.language || 'go' }}
   GO_VERSION: ${{ inputs.go_version || '1.25' }}
   GO_DIR: ${{ inputs.go_dir || 'api' }}
   GO_SUM_PATH: ${{ inputs.go_sum_path || 'api/go.sum' }}
@@ -64,13 +70,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        if: ${{ env.LANGUAGE == 'go' }}
+        uses: actions/setup-go@v5
         with:
           go-version: "${{ env.GO_VERSION }}"
           check-latest: true
           cache-dependency-path: ${{ env.GO_SUM_PATH }}
       # Test the Golang application
       - name: Test Golang application
+        if: ${{ env.LANGUAGE == 'go' }}
         shell: bash
         run: |
           cd "${{ env.GO_DIR }}"
@@ -81,6 +90,7 @@ jobs:
           go test -race "${packages[@]}"
       # Build the Golang application to the dist folder
       - name: Build Golang application
+        if: ${{ env.LANGUAGE == 'go' }}
         run: |
           cd "${{ env.GO_DIR }}"
           git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"

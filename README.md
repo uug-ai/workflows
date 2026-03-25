@@ -34,6 +34,8 @@ jobs:
     secrets: inherit
 ```
 
+`pr-build.yml` defaults to `language: go`. When the caller sets `language: python`, the workflow skips Go setup, formatting, vetting, tests, and the local `go build` step, so Go-specific inputs such as `go_version`, `go_dir`, and `go_sum_path` do not need to be provided.
+
 ## Required caller pattern for pull-request workflows
 
 Reusable workflows do not automatically receive the original pull request payload. The caller must forward pull request values explicitly.
