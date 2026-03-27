@@ -32,6 +32,11 @@ on:
         required: false
         type: string
         default: 'api/go.sum'
+      go_test_race:
+        description: 'Enable Go race detector during tests; sets CGO_ENABLED=1 for the test step'
+        required: false
+        type: boolean
+        default: false
       docker_context:
         description: 'Docker build context'
         required: false
@@ -55,6 +60,7 @@ env:
   GO_VERSION: ${{ inputs.go_version || '1.25' }}
   GO_DIR: ${{ inputs.go_dir || 'api' }}
   GO_SUM_PATH: ${{ inputs.go_sum_path || 'api/go.sum' }}
+  GO_TEST_RACE: ${{ inputs.go_test_race && 'true' || 'false' }}
   BUILD_CONTEXT: ${{ inputs.docker_context || '.' }}
 
 jobs:
@@ -87,7 +93,12 @@ jobs:
           mapfile -t packages < <(go list ./... | grep -v /vendor/)
           go fmt "${packages[@]}"
           go vet "${packages[@]}"
-          go test -race "${packages[@]}"
+          if [[ "${GO_TEST_RACE}" == 'true' ]]; then
+            export CGO_ENABLED=1
+            go test -race "${packages[@]}"
+          else
+            go test "${packages[@]}"
+          fi
       # Build the Golang application to the dist folder
       - name: Build Golang application
         if: ${{ env.LANGUAGE == 'go' }}

@@ -36,6 +36,18 @@ jobs:
 
 `pr-build.yml` defaults to `language: go`. When the caller sets `language: python`, the workflow skips Go setup, formatting, vetting, tests, and the local `go build` step, so Go-specific inputs such as `go_version`, `go_dir`, and `go_sum_path` do not need to be provided.
 
+`pr-build.yml` and `test-coverage.yaml` default to regular `go test` runs. Set `go_test_race: true` in the caller to enable `go test -race`; the reusable workflow enables `CGO_ENABLED=1` automatically for that test step.
+
+```yaml
+jobs:
+  build:
+    uses: uug-ai/workflows/.github/workflows/pr-build.yml@v1.0.0
+    with:
+      project: ${{ github.event.repository.name }}
+      go_test_race: true
+    secrets: inherit
+```
+
 ## Required caller pattern for pull-request workflows
 
 Reusable workflows do not automatically receive the original pull request payload. The caller must forward pull request values explicitly.
