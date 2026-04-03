@@ -31,7 +31,7 @@ on:
         description: 'Whether to create a GitOps pull request after publishing images'
         required: false
         type: boolean
-        default: true
+        default: false
       gitops_repo:
         description: 'GitOps repository in owner/name format'
         required: false
