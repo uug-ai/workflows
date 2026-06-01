@@ -3,10 +3,10 @@ on:
   workflow_call:
     inputs:
       bump:
-        description: 'Which part of the version to bump (major, minor, fix)'
+        description: 'Which part of the version to bump (major, minor, patch)'
         required: false
         type: string
-        default: 'fix'
+        default: 'patch'
     outputs:
       tag:
         description: 'The newly created release tag'
@@ -29,7 +29,7 @@ jobs:
       - name: Determine next version
         id: version
         env:
-          BUMP: ${{ inputs.bump || 'fix' }}
+          BUMP: ${{ inputs.bump || 'patch' }}
         run: |
           set -euo pipefail
 
@@ -57,7 +57,7 @@ jobs:
               minor=$((minor + 1))
               patch=0
               ;;
-            fix)
+            patch)
               patch=$((patch + 1))
               ;;
             *)
