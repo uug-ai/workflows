@@ -136,6 +136,49 @@ Set `create_gitops_pr: false` if you only want to publish images and manifests w
 
 `release-create.yml` builds one image per entry in `runner_matrix` and then creates the published manifests from the `architecture` values in that matrix, so the manifest contents stay aligned with the configured build targets.
 
+## Release bump example
+
+`release-bump.yml` determines the next semantic version from the latest `v*` tag, creates a GitHub release with generated notes, and exposes the new tag as the `tag` output. Because a release created with the default `GITHUB_TOKEN` does not emit a `release: created` event, chain `release-create.yml` directly after it.
+
+```yaml
+name: Bump release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part of the version to bump"
+        required: true
+        default: fix
+        type: choice
+        options: [major, minor, fix]
+
+permissions:
+  contents: write
+
+jobs:
+  bump-release:
+    uses: uug-ai/workflows/.github/workflows/release-bump.yml@main
+    with:
+      bump: ${{ github.event.inputs.bump }}
+    secrets: inherit
+
+  release:
+    needs: bump-release
+    uses: uug-ai/workflows/.github/workflows/release-create.yml@main
+    with:
+      project: ${{ github.event.repository.name }}
+      tag: ${{ needs.bump-release.outputs.tag }}
+      create_gitops_pr: true
+      gitops_repo: uug-ai/gitops
+      gitops_file: environments/staging/my-service/values.yaml
+      gitops_key: image.tag
+      gitops_value: ghcr.io/uug-ai/my-service:${{ needs.bump-release.outputs.tag }}
+    secrets: inherit
+```
+
+The `bump` input accepts `major`, `minor`, or `fix` and defaults to `fix`.
+
 ## Manual workflow example
 
 ```yaml

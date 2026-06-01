@@ -15,6 +15,7 @@ EXPECTED_WORKFLOWS = {
     "pr-delete-environment.yml",
     "pr-description.yml",
     "pr-update-environment.yml",
+    "release-bump.yml",
     "release-create.yml",
     "security-scan.yml",
     "test-coverage.yaml",

@@ -1,0 +1,82 @@
+name: Bump release
+on:
+  workflow_call:
+    inputs:
+      bump:
+        description: 'Which part of the version to bump (major, minor, fix)'
+        required: false
+        type: string
+        default: 'fix'
+    outputs:
+      tag:
+        description: 'The newly created release tag'
+        value: ${{ jobs.bump-release.outputs.tag }}
+
+permissions:
+  contents: write
+
+jobs:
+  bump-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine next version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump || 'fix' }}
+        run: |
+          set -euo pipefail
+
+          # Get the latest semver tag, default to v0.0.0 when none exist.
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -n 1)
+          if [ -z "$latest" ]; then
+            latest="v0.0.0"
+          fi
+          echo "Latest tag: $latest"
+
+          # Strip the leading "v" and split into components.
+          version="${latest#v}"
+          major="${version%%.*}"
+          rest="${version#*.}"
+          minor="${rest%%.*}"
+          patch="${rest#*.}"
+
+          case "$BUMP" in
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            fix)
+              patch=$((patch + 1))
+              ;;
+            *)
+              echo "Unknown bump type: $BUMP" >&2
+              exit 1
+              ;;
+          esac
+
+          next="v${major}.${minor}.${patch}"
+          echo "Next tag: $next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes
