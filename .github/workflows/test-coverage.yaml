@@ -62,9 +62,9 @@ jobs:
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       # Setup Golang for us in the workflow
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
@@ -95,7 +95,7 @@ jobs:
           go tool cover -html=coverage.out -o coverage.html
       # Upload test coverage report
       - name: Upload test coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ inputs.coverage_artifact_name || 'coverage-report' }}
           path: ${{ format('{0}/coverage.html', env.GO_DIR) }}
