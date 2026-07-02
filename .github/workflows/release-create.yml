@@ -27,6 +27,21 @@ on:
         required: false
         type: string
         default: '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]'
+      variant_dockerfile:
+        description: 'Optional path to a second Dockerfile to build and publish as a tag-suffixed variant image (e.g. Dockerfile.onnx). Leave empty to disable.'
+        required: false
+        type: string
+        default: ''
+      variant_suffix:
+        description: 'Tag suffix for the variant image, appended to the release tag and to latest (e.g. -onnx)'
+        required: false
+        type: string
+        default: '-onnx'
+      variant_runner_matrix:
+        description: 'JSON array of {architecture,runner} for the variant build. Defaults to amd64-only since some variant images (e.g. ONNX) are x64-only.'
+        required: false
+        type: string
+        default: '[{"architecture":"amd64","runner":"ubuntu-24.04"}]'
       create_gitops_pr:
         description: 'Whether to create a GitOps pull request after publishing images'
         required: false
@@ -84,6 +99,7 @@ env:
   TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
   BUILD_CONTEXT: ${{ inputs.docker_context || '.' }}
   RUNNER_MATRIX: ${{ inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]' }}
+  VARIANT_SUFFIX: ${{ inputs.variant_suffix || '-onnx' }}
   GITOPS_REPO: ${{ inputs.gitops_repo || 'uug-ai/gitops' }}
   GITOPS_FILE: ${{ inputs.gitops_file || 'environments/staging/kerberos-hub/values.yaml' }}
   GITOPS_KEY: ${{ inputs.gitops_key || 'kerberoshub.api.tag' }}
@@ -151,6 +167,71 @@ jobs:
 
           docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:latest" "${image_refs[@]}"
           docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:latest"
+
+  # Optional second image built from inputs.variant_dockerfile (e.g. Dockerfile.onnx).
+  # Published as ghcr.io/<org>/<project>:<tag><variant_suffix> (and :latest<variant_suffix>).
+  # Runs only when variant_dockerfile is provided; otherwise skipped entirely.
+  build-variant:
+    if: ${{ inputs.variant_dockerfile != '' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include: ${{ fromJson(inputs.variant_runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"}]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.USERNAME }}
+          password: ${{ secrets.TOKEN }}
+      - name: Run Build
+        run: |
+          docker build --provenance=false -f "${{ inputs.variant_dockerfile }}" -t "${{ matrix.architecture }}" \
+          --build-arg "project=${{ env.PROJECT }}" \
+          --build-arg "github_username=${{ secrets.USERNAME }}" \
+          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.BUILD_CONTEXT }}"
+
+      - name: Build and push Docker image
+        run: |
+          docker tag "${{ matrix.architecture }}" "ghcr.io/$ORGANIZATION/$PROJECT-platform:${{ matrix.architecture }}-${{ env.TAG }}${{ env.VARIANT_SUFFIX }}"
+          docker push "ghcr.io/$ORGANIZATION/$PROJECT-platform:${{ matrix.architecture }}-${{ env.TAG }}${{ env.VARIANT_SUFFIX }}"
+
+  create-manifest-variant:
+    if: ${{ inputs.variant_dockerfile != '' }}
+    runs-on: ubuntu-24.04
+    needs: [build-variant]
+    env:
+      VARIANT_RUNNER_MATRIX: ${{ inputs.variant_runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"}]' }}
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.USERNAME }}
+          password: ${{ secrets.TOKEN }}
+      - name: Wait for image propagation
+        run: sleep 10
+      - name: Create and push manifests
+        shell: bash
+        run: |
+          mapfile -t image_refs < <(python3 - <<'PY'
+          import json
+          import os
+
+          matrix = json.loads(os.environ["VARIANT_RUNNER_MATRIX"])
+          suffix = os.environ["VARIANT_SUFFIX"]
+          for entry in matrix:
+              print(f'ghcr.io/{os.environ["ORGANIZATION"]}/{os.environ["PROJECT"]}-platform:{entry["architecture"]}-{os.environ["TAG"]}{suffix}')
+          PY
+          )
+
+          docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:$TAG$VARIANT_SUFFIX" "${image_refs[@]}"
+          docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:$TAG$VARIANT_SUFFIX"
+
+          docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:latest$VARIANT_SUFFIX" "${image_refs[@]}"
+          docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:latest$VARIANT_SUFFIX"
 
   update-gitops:
     runs-on: ubuntu-24.04
