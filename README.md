@@ -69,8 +69,8 @@ jobs:
       project: ${{ github.event.repository.name }}
       pr_number: ${{ github.event.number }}
       sha: ${{ github.sha }}
-      organization: uug-ai
-      gitops_repo: uug-ai/gitops
+      organization: your-org
+      gitops_repo: your-org/gitops
     secrets: inherit
 ```
 
@@ -106,7 +106,7 @@ jobs:
     uses: uug-ai/workflows/.github/workflows/pr-description.yml@main
     with:
       pr_number: ${{ github.event.number }}
-      pull_request_url: https://pr${{ github.event.number }}.api.kerberos.lol
+      pull_request_url: https://pr${{ github.event.number }}.api.example.com
     secrets: inherit
 ```
 
@@ -126,7 +126,7 @@ jobs:
       project: ${{ github.event.repository.name }}
       tag: ${{ github.event.release.tag_name }}
       create_gitops_pr: true
-      gitops_repo: uug-ai/gitops
+      gitops_repo: your-org/gitops
       gitops_file: environments/staging/my-service/values.yaml
       gitops_key: image.tag
     secrets: inherit
@@ -170,10 +170,10 @@ jobs:
       project: ${{ github.event.repository.name }}
       tag: ${{ needs.bump-release.outputs.tag }}
       create_gitops_pr: true
-      gitops_repo: uug-ai/gitops
+      gitops_repo: your-org/gitops
       gitops_file: environments/staging/my-service/values.yaml
       gitops_key: image.tag
-      gitops_value: ghcr.io/uug-ai/my-service:${{ needs.bump-release.outputs.tag }}
+      gitops_value: ghcr.io/your-org/my-service:${{ needs.bump-release.outputs.tag }}
     secrets: inherit
 ```
 
