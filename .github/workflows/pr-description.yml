@@ -20,8 +20,6 @@ on:
     secrets:
       AZURE_OPENAI_API_KEY:
         required: true
-      OPENAI_MODEL:
-        required: false
       AZURE_OPENAI_ENDPOINT:
         required: false
       AZURE_OPENAI_VERSION:
@@ -48,6 +46,6 @@ jobs:
           azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT || vars.AZURE_OPENAI_ENDPOINT }}
           azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION || vars.AZURE_OPENAI_VERSION }}
-          openai_model: ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL || 'gpt-4o' }}
+          openai_model: ${{ vars.OPENAI_MODEL || 'gpt-4o' }}
           pull_request_url: ${{ env.PULL_REQUEST_URL }}
           overwrite_description: ${{ inputs.overwrite_description != false }}
