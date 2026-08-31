@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: '.'
+      use_private_module_auth:
+        description: 'Whether to pass GitHub credentials to Docker for private module downloads'
+        required: false
+        type: boolean
+        default: true
       runner_matrix:
         description: 'JSON array of objects with architecture and runner keys'
         required: false
@@ -74,9 +79,13 @@ on:
         default: ''
     secrets:
       USERNAME:
-        required: true
+        required: false
       TOKEN:
-        required: true
+        required: false
+
+permissions:
+  contents: read
+  packages: write
 
 env:
   ORGANIZATION: ${{ inputs.organization || 'uug-ai' }}
@@ -107,9 +116,15 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ secrets.USERNAME }}
-          password: ${{ secrets.TOKEN }}
-      - name: Run Build
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Run public dependency build
+        if: ${{ !inputs.use_private_module_auth }}
+        run: |
+          docker build --provenance=false -t "${{ matrix.architecture }}" \
+          --build-arg "project=${{ env.PROJECT }}" "${{ env.BUILD_CONTEXT }}"
+      - name: Run private dependency build
+        if: ${{ inputs.use_private_module_auth }}
         run: |
           docker build --provenance=false -t "${{ matrix.architecture }}" \
           --build-arg "project=${{ env.PROJECT }}" \
@@ -129,8 +144,8 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ secrets.USERNAME }}
-          password: ${{ secrets.TOKEN }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - name: Wait for image propagation
         run: sleep 10
       - name: Create and push manifests

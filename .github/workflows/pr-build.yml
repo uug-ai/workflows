@@ -37,6 +37,16 @@ on:
         required: false
         type: boolean
         default: false
+      use_private_module_auth:
+        description: 'Configure USERNAME/TOKEN authentication for private Go modules and Docker builds'
+        required: false
+        type: boolean
+        default: true
+      registry_login:
+        description: 'Log in to GHCR before building the image'
+        required: false
+        type: boolean
+        default: true
       docker_context:
         description: 'Docker build context'
         required: false
@@ -49,9 +59,9 @@ on:
         default: '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]'
     secrets:
       USERNAME:
-        required: true
+        required: false
       TOKEN:
-        required: true
+        required: false
 
 env:
   ORGANIZATION: ${{ inputs.organization || 'uug-ai' }}
@@ -83,13 +93,15 @@ jobs:
           go-version: "${{ env.GO_VERSION }}"
           check-latest: true
           cache-dependency-path: ${{ env.GO_SUM_PATH }}
+      - name: Configure private module authentication
+        if: ${{ env.LANGUAGE == 'go' && inputs.use_private_module_auth }}
+        run: git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"
       # Test the Golang application
       - name: Test Golang application
         if: ${{ env.LANGUAGE == 'go' }}
         shell: bash
         run: |
           cd "${{ env.GO_DIR }}"
-          git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"
           mapfile -t packages < <(go list ./... | grep -v /vendor/)
           go fmt "${packages[@]}"
           go vet "${packages[@]}"
@@ -104,17 +116,22 @@ jobs:
         if: ${{ env.LANGUAGE == 'go' }}
         run: |
           cd "${{ env.GO_DIR }}"
-          git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"
           go build -o main
       - name: Log in to GitHub Container Registry
+        if: ${{ inputs.registry_login }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ secrets.USERNAME }}
           password: ${{ secrets.TOKEN }}
       - name: Run Build
+        shell: bash
         run: |
-          docker build -t "${{ matrix.architecture }}" \
-          --build-arg "project=${{ env.PROJECT }}" \
-          --build-arg "github_username=${{ secrets.USERNAME }}" \
-          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.BUILD_CONTEXT }}"
+          build_args=(--build-arg "project=${{ env.PROJECT }}")
+          if [[ "${{ inputs.use_private_module_auth }}" == "true" ]]; then
+            build_args+=(
+              --build-arg "github_username=${{ secrets.USERNAME }}"
+              --build-arg "github_token=${{ secrets.TOKEN }}"
+            )
+          fi
+          docker build -t "${{ matrix.architecture }}" "${build_args[@]}" "${{ env.BUILD_CONTEXT }}"

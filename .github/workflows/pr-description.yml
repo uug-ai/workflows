@@ -18,12 +18,8 @@ on:
         type: boolean
         default: true
     secrets:
-      TOKEN:
-        required: true
       AZURE_OPENAI_API_KEY:
         required: true
-      OPENAI_MODEL:
-        required: false
       AZURE_OPENAI_ENDPOINT:
         required: false
       AZURE_OPENAI_VERSION:
@@ -37,16 +33,19 @@ env:
 jobs:
   openai-pr-description:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      pull-requests: write
 
     steps:
       - uses: actions/checkout@v4
       - name: Autofill PR description if empty using OpenAI
         uses: cedricve/azureopenai-pr-description@master
         with:
-          github_token: ${{ secrets.TOKEN }}
+          github_token: ${{ github.token }}
           azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT || vars.AZURE_OPENAI_ENDPOINT }}
           azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION || vars.AZURE_OPENAI_VERSION }}
-          openai_model: ${{ secrets.OPENAI_MODEL || vars.OPENAI_MODEL || 'gpt-4o' }}
+          openai_model: ${{ vars.OPENAI_MODEL || 'gpt-4o' }}
           pull_request_url: ${{ env.PULL_REQUEST_URL }}
           overwrite_description: ${{ inputs.overwrite_description != false }}

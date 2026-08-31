@@ -33,6 +33,11 @@ on:
         required: false
         type: boolean
         default: false
+      use_private_module_auth:
+        description: 'Configure USERNAME/TOKEN authentication for private Go modules'
+        required: false
+        type: boolean
+        default: true
       coverage_artifact_name:
         description: 'Artifact name used for the HTML coverage report'
         required: false
@@ -40,9 +45,9 @@ on:
         default: 'coverage-report'
     secrets:
       USERNAME:
-        required: true
+        required: false
       TOKEN:
-        required: true
+        required: false
       CODECOV_TOKEN:
         required: false
 
@@ -69,12 +74,14 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           check-latest: true
           cache-dependency-path: ${{ env.GO_SUM_PATH }}
+      - name: Configure private module authentication
+        if: ${{ inputs.use_private_module_auth }}
+        run: git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"
       # Test the Golang application
       - name: Test Golang application
         shell: bash
         run: |
           cd "${{ env.GO_DIR }}"
-          git config --global url."https://${{ secrets.USERNAME }}:${{ secrets.TOKEN }}@github.com/".insteadOf "https://github.com/"
           mapfile -t packages < <(go list ./... | grep -v /vendor/)
           go fmt "${packages[@]}"
           go vet "${packages[@]}"
