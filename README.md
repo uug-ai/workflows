@@ -119,6 +119,10 @@ on:
   release:
     types: [created]
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   release:
     uses: uug-ai/workflows/.github/workflows/release-create.yml@main
@@ -135,6 +139,11 @@ jobs:
 Set `create_gitops_pr: false` if you only want to publish images and manifests without opening a GitOps pull request.
 
 `release-create.yml` builds one image per entry in `runner_matrix` and then creates the published manifests from the `architecture` values in that matrix, so the manifest contents stay aligned with the configured build targets.
+
+The caller must grant `packages: write`. A reusable workflow can narrow the
+caller's `GITHUB_TOKEN`, but it cannot elevate a caller whose permission ceiling
+is read-only. The repository's default workflow permission may remain `read`;
+the explicit caller grant above applies only to this release workflow.
 
 ## Release bump example
 
@@ -155,6 +164,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   bump-release:
