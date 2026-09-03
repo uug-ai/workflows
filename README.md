@@ -145,6 +145,11 @@ caller's `GITHUB_TOKEN`, but it cannot elevate a caller whose permission ceiling
 is read-only. The repository's default workflow permission may remain `read`;
 the explicit caller grant above applies only to this release workflow.
 
+Registry login prefers `REGISTRY_USERNAME` / `REGISTRY_TOKEN`, then the existing
+`USERNAME` / `TOKEN` pair, and finally the caller's `github.actor` /
+`github.token`. Use a registry token when an existing GHCR package does not grant
+the caller repository's `GITHUB_TOKEN` write access.
+
 ## Release bump example
 
 `release-bump.yml` determines the next semantic version from the latest `v*` tag, creates a GitHub release with generated notes, and exposes the new tag as the `tag` output. Because a release created with the default `GITHUB_TOKEN` does not emit a `release: created` event, chain `release-create.yml` directly after it.
@@ -229,6 +234,8 @@ These reusable workflows expect the consuming repository to provide the same sec
 
 - `TOKEN`
 - `USERNAME`
+- `REGISTRY_TOKEN` (optional dedicated package-publishing credential)
+- `REGISTRY_USERNAME` (optional username paired with `REGISTRY_TOKEN`)
 - `CODECOV_TOKEN`
 - `AZURE_OPENAI_API_KEY`
 
