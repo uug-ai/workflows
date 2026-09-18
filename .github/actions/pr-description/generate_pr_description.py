@@ -58,6 +58,15 @@ class Config:
         if not azure_openai_deployment:
             raise ValueError("INPUT_AZURE_OPENAI_DEPLOYMENT is required")
 
+        azure_openai_endpoint = required_environment(
+            "INPUT_AZURE_OPENAI_ENDPOINT"
+        ).rstrip("/")
+        azure_openai_version = os.environ.get(
+            "INPUT_AZURE_OPENAI_VERSION", ""
+        ).strip()
+        if not is_v1_endpoint(azure_openai_endpoint) and not azure_openai_version:
+            raise ValueError("INPUT_AZURE_OPENAI_VERSION is required for legacy endpoints")
+
         return cls(
             github_api_url=required_environment("GITHUB_API_URL").rstrip("/"),
             github_repository=required_environment("GITHUB_REPOSITORY"),
@@ -68,10 +77,8 @@ class Config:
                 os.environ.get("INPUT_OVERWRITE_DESCRIPTION", "true")
             ),
             azure_openai_api_key=required_environment("INPUT_AZURE_OPENAI_API_KEY"),
-            azure_openai_endpoint=required_environment(
-                "INPUT_AZURE_OPENAI_ENDPOINT"
-            ).rstrip("/"),
-            azure_openai_version=required_environment("INPUT_AZURE_OPENAI_VERSION"),
+            azure_openai_endpoint=azure_openai_endpoint,
+            azure_openai_version=azure_openai_version,
             azure_openai_deployment=azure_openai_deployment,
         )
 
@@ -93,6 +100,10 @@ def parse_boolean(value: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"invalid boolean value: {value}")
+
+
+def is_v1_endpoint(endpoint: str) -> bool:
+    return endpoint.rstrip("/").endswith("/openai/v1")
 
 
 def request_json(
@@ -196,6 +207,9 @@ def build_prompt(title: str, files: list[dict[str, Any]]) -> str:
 
 
 def azure_completions_url(config: Config) -> str:
+    if is_v1_endpoint(config.azure_openai_endpoint):
+        return f"{config.azure_openai_endpoint}/chat/completions"
+
     deployment = quote(config.azure_openai_deployment, safe="")
     query = urlencode({"api-version": config.azure_openai_version})
     return (
@@ -212,6 +226,8 @@ def generate_description(config: Config, prompt: str, request: JsonRequest) -> s
         ],
         "max_completion_tokens": MAX_COMPLETION_TOKENS,
     }
+    if is_v1_endpoint(config.azure_openai_endpoint):
+        payload["model"] = config.azure_openai_deployment
     headers = {"api-key": config.azure_openai_api_key}
 
     try:

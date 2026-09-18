@@ -119,6 +119,11 @@ The generator is maintained as the first-party composite action in
 directly without a container image or runtime package installation.
 When `azure_openai_deployment` is omitted, the workflow uses the inherited
 `AZURE_OPENAI_DEPLOYMENT` secret before checking configuration variables.
+For the Azure OpenAI v1 API, set `AZURE_OPENAI_ENDPOINT` to the complete base
+URL, such as `https://your-resource.openai.azure.com/openai/v1`. The generator
+calls `chat/completions` below that URL and sends the deployment name as
+`model`; `AZURE_OPENAI_VERSION` is not required. Legacy resource-root endpoints
+remain supported and require `AZURE_OPENAI_VERSION`.
 
 ## Release workflow example
 

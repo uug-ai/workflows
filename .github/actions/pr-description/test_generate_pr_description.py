@@ -23,6 +23,22 @@ def config(**overrides):
 
 
 class GeneratePullRequestDescriptionTests(unittest.TestCase):
+    def test_config_does_not_require_api_version_for_v1_endpoint(self):
+        environment = {
+            "GITHUB_API_URL": "https://api.github.com",
+            "GITHUB_REPOSITORY": "uug-ai/example",
+            "INPUT_AZURE_OPENAI_API_KEY": "azure-key",
+            "INPUT_AZURE_OPENAI_DEPLOYMENT": "model-router",
+            "INPUT_AZURE_OPENAI_ENDPOINT": "https://example.openai.azure.com/openai/v1",
+            "INPUT_GITHUB_TOKEN": "github-token",
+            "INPUT_PULL_REQUEST_NUMBER": "42",
+        }
+
+        with patch.dict(os.environ, environment, clear=True):
+            loaded = generator.Config.from_environment()
+
+        self.assertEqual(loaded.azure_openai_version, "")
+
     def test_config_accepts_deprecated_openai_model_input(self):
         environment = {
             "GITHUB_API_URL": "https://api.github.com",
@@ -126,6 +142,32 @@ class GeneratePullRequestDescriptionTests(unittest.TestCase):
             update_request["payload"]["body"],
             "## Description\n\nHandles transient disconnects.",
         )
+
+    def test_v1_endpoint_puts_deployment_in_request_body(self):
+        calls = []
+
+        def request(url, **kwargs):
+            calls.append((url, kwargs))
+            return {
+                "choices": [
+                    {"message": {"content": "Handles transient disconnects."}}
+                ]
+            }
+
+        v1_config = config(
+            azure_openai_endpoint="https://aihubproduction.openai.azure.com/openai/v1",
+            azure_openai_version="",
+            azure_openai_deployment="model-router",
+        )
+        generator.generate_description(v1_config, "Changes", request)
+
+        url, request_options = calls[0]
+        self.assertEqual(
+            url,
+            "https://aihubproduction.openai.azure.com/openai/v1/chat/completions",
+        )
+        self.assertEqual(request_options["payload"]["model"], "model-router")
+        self.assertNotIn("api-version", url)
 
 
 if __name__ == "__main__":

@@ -23,8 +23,9 @@ inputs:
     description: Azure OpenAI endpoint
     required: true
   azure_openai_version:
-    description: Azure OpenAI API version
-    required: true
+    description: Azure OpenAI API version, required only for legacy endpoints
+    required: false
+    default: ''
   azure_openai_deployment:
     description: Azure OpenAI deployment name
     required: false
