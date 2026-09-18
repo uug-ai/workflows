@@ -50,6 +50,14 @@ class Config:
         if pull_request_number < 1:
             raise ValueError("INPUT_PULL_REQUEST_NUMBER must be positive")
 
+        azure_openai_deployment = os.environ.get(
+            "INPUT_AZURE_OPENAI_DEPLOYMENT", ""
+        ).strip()
+        if not azure_openai_deployment:
+            azure_openai_deployment = os.environ.get("INPUT_OPENAI_MODEL", "").strip()
+        if not azure_openai_deployment:
+            raise ValueError("INPUT_AZURE_OPENAI_DEPLOYMENT is required")
+
         return cls(
             github_api_url=required_environment("GITHUB_API_URL").rstrip("/"),
             github_repository=required_environment("GITHUB_REPOSITORY"),
@@ -64,9 +72,7 @@ class Config:
                 "INPUT_AZURE_OPENAI_ENDPOINT"
             ).rstrip("/"),
             azure_openai_version=required_environment("INPUT_AZURE_OPENAI_VERSION"),
-            azure_openai_deployment=required_environment(
-                "INPUT_AZURE_OPENAI_DEPLOYMENT"
-            ),
+            azure_openai_deployment=azure_openai_deployment,
         )
 
 

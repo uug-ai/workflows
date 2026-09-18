@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest.mock import patch
 
 import generate_pr_description as generator
 
@@ -21,6 +23,23 @@ def config(**overrides):
 
 
 class GeneratePullRequestDescriptionTests(unittest.TestCase):
+    def test_config_accepts_deprecated_openai_model_input(self):
+        environment = {
+            "GITHUB_API_URL": "https://api.github.com",
+            "GITHUB_REPOSITORY": "uug-ai/example",
+            "INPUT_AZURE_OPENAI_API_KEY": "azure-key",
+            "INPUT_AZURE_OPENAI_ENDPOINT": "https://example.openai.azure.com",
+            "INPUT_AZURE_OPENAI_VERSION": "2024-02-15-preview",
+            "INPUT_GITHUB_TOKEN": "github-token",
+            "INPUT_OPENAI_MODEL": "legacy-deployment",
+            "INPUT_PULL_REQUEST_NUMBER": "42",
+        }
+
+        with patch.dict(os.environ, environment, clear=True):
+            loaded = generator.Config.from_environment()
+
+        self.assertEqual(loaded.azure_openai_deployment, "legacy-deployment")
+
     def test_build_prompt_includes_text_patches_and_ignores_binary_files(self):
         prompt = generator.build_prompt(
             "Handle reconnects",

@@ -27,7 +27,12 @@ inputs:
     required: true
   azure_openai_deployment:
     description: Azure OpenAI deployment name
-    required: true
+    required: false
+    default: ''
+  openai_model:
+    description: Deprecated alias for azure_openai_deployment
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -40,6 +45,7 @@ runs:
         INPUT_AZURE_OPENAI_ENDPOINT: ${{ inputs.azure_openai_endpoint }}
         INPUT_AZURE_OPENAI_VERSION: ${{ inputs.azure_openai_version }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
+        INPUT_OPENAI_MODEL: ${{ inputs.openai_model }}
         INPUT_OVERWRITE_DESCRIPTION: ${{ inputs.overwrite_description }}
         INPUT_PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
         INPUT_PULL_REQUEST_URL: ${{ inputs.pull_request_url }}
