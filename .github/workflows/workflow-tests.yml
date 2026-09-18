@@ -32,3 +32,5 @@ jobs:
         run: pip install pyyaml
       - name: Validate reusable workflow contracts
         run: python check_workflows.py
+      - name: Test pull request description generator
+        run: python -m unittest discover -s .github/actions/pr-description -p 'test_*.py'

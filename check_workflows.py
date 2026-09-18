@@ -7,8 +7,12 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent
 WORKFLOWS_DIR = ROOT / ".github" / "workflows"
+PR_DESCRIPTION_ACTION_DIR = ROOT / ".github" / "actions" / "pr-description"
 README = ROOT / "README.md"
 FORBIDDEN_SECRETS = {"OPENAI_API_KEY", "OPENAI_MODEL"}
+PR_DESCRIPTION_ACTION_REFERENCE = (
+    "uug-ai/workflows/.github/actions/pr-description@main"
+)
 EXPECTED_WORKFLOWS = {
     "issue-userstory-create.yml",
     "pr-build.yml",
@@ -87,6 +91,37 @@ def validate_readme(errors: list[str]) -> None:
             errors.append(f"README.md: forbidden secret still documented: {secret_name}")
 
 
+def validate_pr_description_action(errors: list[str]) -> None:
+    action_path = PR_DESCRIPTION_ACTION_DIR / "action.yml"
+    generator_path = PR_DESCRIPTION_ACTION_DIR / "generate_pr_description.py"
+    if not action_path.is_file():
+        errors.append("Missing PR description action.yml")
+        return
+    if not generator_path.is_file():
+        errors.append("Missing PR description generator")
+
+    action = load_yaml(action_path)
+    runs = action.get("runs")
+    if not isinstance(runs, dict) or runs.get("using") != "composite":
+        errors.append("PR description action must be a composite action")
+
+    expected_inputs = {
+        "github_token",
+        "pull_request_number",
+        "azure_openai_api_key",
+        "azure_openai_endpoint",
+        "azure_openai_version",
+    }
+    inputs = action.get("inputs")
+    if not isinstance(inputs, dict) or not expected_inputs.issubset(inputs):
+        errors.append("PR description action is missing required inputs")
+
+    workflow_path = WORKFLOWS_DIR / "pr-description.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    if PR_DESCRIPTION_ACTION_REFERENCE not in workflow_text:
+        errors.append("PR description workflow must use the first-party action")
+
+
 def main() -> int:
     errors: list[str] = []
     workflow_names = {path.name for path in WORKFLOWS_DIR.glob("*.yml")}
@@ -100,6 +135,7 @@ def main() -> int:
         validate_workflow(WORKFLOWS_DIR / workflow_name, errors)
 
     validate_readme(errors)
+    validate_pr_description_action(errors)
 
     if errors:
         for message in errors:

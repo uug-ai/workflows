@@ -26,7 +26,6 @@ on:
         required: false
 
 env:
-  PROJECT: ${{ github.event.repository.name }}
   PR_NUMBER: ${{ inputs.pr_number || github.event.number }}
   PULL_REQUEST_URL: ${{ inputs.pull_request_url == '__AUTO_GENERATE_PR_URL__' && format('https://pr{0}.api.kerberos.lol', github.event.number) || inputs.pull_request_url }}
   
@@ -34,18 +33,17 @@ jobs:
   openai-pr-description:
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
       pull-requests: write
 
     steps:
-      - uses: actions/checkout@v4
-      - name: Autofill PR description if empty using OpenAI
-        uses: cedricve/azureopenai-pr-description@master
+      - name: Autofill PR description using Azure OpenAI
+        uses: uug-ai/workflows/.github/actions/pr-description@main
         with:
           github_token: ${{ github.token }}
+          pull_request_number: ${{ env.PR_NUMBER }}
+          pull_request_url: ${{ env.PULL_REQUEST_URL }}
+          overwrite_description: ${{ inputs.overwrite_description }}
           azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT || vars.AZURE_OPENAI_ENDPOINT }}
           azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION || vars.AZURE_OPENAI_VERSION }}
           openai_model: ${{ vars.OPENAI_MODEL || 'gpt-4o' }}
-          pull_request_url: ${{ env.PULL_REQUEST_URL }}
-          overwrite_description: ${{ inputs.overwrite_description != false }}

@@ -1,0 +1,47 @@
+name: Generate pull request description
+description: Generate and update a pull request description with Azure OpenAI
+
+inputs:
+  github_token:
+    description: GitHub token used to read and update the pull request
+    required: true
+  pull_request_number:
+    description: Pull request number to describe
+    required: true
+  pull_request_url:
+    description: Optional URL for the pull request environment
+    required: false
+    default: ''
+  overwrite_description:
+    description: Whether to replace an existing pull request description
+    required: false
+    default: 'true'
+  azure_openai_api_key:
+    description: Azure OpenAI API key
+    required: true
+  azure_openai_endpoint:
+    description: Azure OpenAI endpoint
+    required: true
+  azure_openai_version:
+    description: Azure OpenAI API version
+    required: true
+  openai_model:
+    description: Azure OpenAI deployment name
+    required: false
+    default: gpt-4o
+
+runs:
+  using: composite
+  steps:
+    - name: Generate pull request description
+      shell: bash
+      env:
+        INPUT_AZURE_OPENAI_API_KEY: ${{ inputs.azure_openai_api_key }}
+        INPUT_AZURE_OPENAI_ENDPOINT: ${{ inputs.azure_openai_endpoint }}
+        INPUT_AZURE_OPENAI_VERSION: ${{ inputs.azure_openai_version }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
+        INPUT_OPENAI_MODEL: ${{ inputs.openai_model }}
+        INPUT_OVERWRITE_DESCRIPTION: ${{ inputs.overwrite_description }}
+        INPUT_PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+        INPUT_PULL_REQUEST_URL: ${{ inputs.pull_request_url }}
+      run: python3 "${GITHUB_ACTION_PATH}/generate_pr_description.py"

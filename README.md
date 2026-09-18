@@ -101,6 +101,9 @@ name: Autofill PR Description
 on:
   pull_request:
 
+permissions:
+  pull-requests: write
+
 jobs:
   describe:
     uses: uug-ai/workflows/.github/workflows/pr-description.yml@main
@@ -109,6 +112,10 @@ jobs:
       pull_request_url: https://pr${{ github.event.number }}.api.example.com
     secrets: inherit
 ```
+
+The generator is maintained as the first-party composite action in
+`.github/actions/pr-description` and calls the GitHub and Azure OpenAI APIs
+directly without a container image or runtime package installation.
 
 ## Release workflow example
 
