@@ -38,7 +38,7 @@ class Config:
     azure_openai_api_key: str
     azure_openai_endpoint: str
     azure_openai_version: str
-    openai_model: str
+    azure_openai_deployment: str
 
     @classmethod
     def from_environment(cls) -> "Config":
@@ -64,7 +64,9 @@ class Config:
                 "INPUT_AZURE_OPENAI_ENDPOINT"
             ).rstrip("/"),
             azure_openai_version=required_environment("INPUT_AZURE_OPENAI_VERSION"),
-            openai_model=required_environment("INPUT_OPENAI_MODEL"),
+            azure_openai_deployment=required_environment(
+                "INPUT_AZURE_OPENAI_DEPLOYMENT"
+            ),
         )
 
 
@@ -188,7 +190,7 @@ def build_prompt(title: str, files: list[dict[str, Any]]) -> str:
 
 
 def azure_completions_url(config: Config) -> str:
-    deployment = quote(config.openai_model, safe="")
+    deployment = quote(config.azure_openai_deployment, safe="")
     query = urlencode({"api-version": config.azure_openai_version})
     return (
         f"{config.azure_openai_endpoint}/openai/deployments/{deployment}"

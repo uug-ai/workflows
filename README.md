@@ -110,12 +110,15 @@ jobs:
     with:
       pr_number: ${{ github.event.number }}
       pull_request_url: https://pr${{ github.event.number }}.api.example.com
+      azure_openai_deployment: your-azure-deployment
     secrets: inherit
 ```
 
 The generator is maintained as the first-party composite action in
 `.github/actions/pr-description` and calls the GitHub and Azure OpenAI APIs
 directly without a container image or runtime package installation.
+When `azure_openai_deployment` is omitted, the workflow uses the inherited
+`AZURE_OPENAI_DEPLOYMENT` secret before checking configuration variables.
 
 ## Release workflow example
 

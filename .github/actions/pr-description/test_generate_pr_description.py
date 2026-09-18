@@ -14,7 +14,7 @@ def config(**overrides):
         "azure_openai_api_key": "azure-key",
         "azure_openai_endpoint": "https://example.openai.azure.com",
         "azure_openai_version": "2024-02-15-preview",
-        "openai_model": "gpt-4o deployment",
+        "azure_openai_deployment": "gpt-4o deployment",
     }
     values.update(overrides)
     return generator.Config(**values)

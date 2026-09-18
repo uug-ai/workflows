@@ -17,6 +17,11 @@ on:
         required: false
         type: boolean
         default: true
+      azure_openai_deployment:
+        description: 'Azure OpenAI deployment name'
+        required: false
+        type: string
+        default: ''
     secrets:
       AZURE_OPENAI_API_KEY:
         required: true
@@ -46,4 +51,4 @@ jobs:
           azure_openai_api_key: ${{ secrets.AZURE_OPENAI_API_KEY }}
           azure_openai_endpoint: ${{ secrets.AZURE_OPENAI_ENDPOINT || vars.AZURE_OPENAI_ENDPOINT }}
           azure_openai_version: ${{ secrets.AZURE_OPENAI_VERSION || vars.AZURE_OPENAI_VERSION }}
-          openai_model: ${{ vars.OPENAI_MODEL || 'gpt-4o' }}
+          azure_openai_deployment: ${{ inputs.azure_openai_deployment || secrets.AZURE_OPENAI_DEPLOYMENT || secrets.OPENAI_MODEL || vars.AZURE_OPENAI_DEPLOYMENT || vars.OPENAI_MODEL }}

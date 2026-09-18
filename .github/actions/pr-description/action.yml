@@ -25,10 +25,9 @@ inputs:
   azure_openai_version:
     description: Azure OpenAI API version
     required: true
-  openai_model:
+  azure_openai_deployment:
     description: Azure OpenAI deployment name
-    required: false
-    default: gpt-4o
+    required: true
 
 runs:
   using: composite
@@ -37,10 +36,10 @@ runs:
       shell: bash
       env:
         INPUT_AZURE_OPENAI_API_KEY: ${{ inputs.azure_openai_api_key }}
+        INPUT_AZURE_OPENAI_DEPLOYMENT: ${{ inputs.azure_openai_deployment }}
         INPUT_AZURE_OPENAI_ENDPOINT: ${{ inputs.azure_openai_endpoint }}
         INPUT_AZURE_OPENAI_VERSION: ${{ inputs.azure_openai_version }}
         INPUT_GITHUB_TOKEN: ${{ inputs.github_token }}
-        INPUT_OPENAI_MODEL: ${{ inputs.openai_model }}
         INPUT_OVERWRITE_DESCRIPTION: ${{ inputs.overwrite_description }}
         INPUT_PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
         INPUT_PULL_REQUEST_URL: ${{ inputs.pull_request_url }}

@@ -109,6 +109,7 @@ def validate_pr_description_action(errors: list[str]) -> None:
         "github_token",
         "pull_request_number",
         "azure_openai_api_key",
+        "azure_openai_deployment",
         "azure_openai_endpoint",
         "azure_openai_version",
     }
