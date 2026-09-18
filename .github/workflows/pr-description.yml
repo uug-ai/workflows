@@ -25,9 +25,13 @@ on:
     secrets:
       AZURE_OPENAI_API_KEY:
         required: true
+      AZURE_OPENAI_DEPLOYMENT:
+        required: false
       AZURE_OPENAI_ENDPOINT:
         required: false
       AZURE_OPENAI_VERSION:
+        required: false
+      OPENAI_MODEL:
         required: false
 
 env:

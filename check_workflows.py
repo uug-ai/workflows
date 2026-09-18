@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent
 WORKFLOWS_DIR = ROOT / ".github" / "workflows"
 PR_DESCRIPTION_ACTION_DIR = ROOT / ".github" / "actions" / "pr-description"
 README = ROOT / "README.md"
-FORBIDDEN_SECRETS = {"OPENAI_API_KEY", "OPENAI_MODEL"}
+FORBIDDEN_SECRETS = {"OPENAI_API_KEY"}
 PR_DESCRIPTION_ACTION_REFERENCE = (
     "uug-ai/workflows/.github/actions/pr-description@main"
 )
