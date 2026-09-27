@@ -123,7 +123,10 @@ For the Azure OpenAI v1 API, set `AZURE_OPENAI_ENDPOINT` to the complete base
 URL, such as `https://your-resource.openai.azure.com/openai/v1`. The generator
 calls `chat/completions` below that URL and sends the deployment name as
 `model`; `AZURE_OPENAI_VERSION` is not required. Legacy resource-root endpoints
-remain supported and require `AZURE_OPENAI_VERSION`.
+remain supported and require `AZURE_OPENAI_VERSION`. The action retries
+rate-limit, timeout, server, malformed-response, and empty-completion failures up
+to three times. It respects numeric `Retry-After` headers and increases the
+completion budget when Azure reports that the token limit was reached.
 
 ## Release workflow example
 
@@ -270,4 +273,3 @@ If you want to exercise a reusable workflow directly during development, create 
 ```bash
 python check_workflows.py
 ```
-

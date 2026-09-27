@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -12,7 +13,11 @@ from urllib.request import Request, urlopen
 
 MAX_CHANGED_FILES = 300
 MAX_PROMPT_CHARACTERS = 30_000
-MAX_COMPLETION_TOKENS = 1_000
+INITIAL_COMPLETION_TOKENS = 4_000
+MAX_COMPLETION_TOKENS = 8_000
+MAX_COMPLETION_ATTEMPTS = 3
+MAX_REQUEST_ATTEMPTS = 3
+MAX_RETRY_DELAY_SECONDS = 30
 SYSTEM_PROMPT = """You write concise pull request descriptions for software engineers.
 Return only the Markdown body without a title or a 'Description' heading.
 Explain the motivation, important behavior changes, and implementation details
@@ -106,6 +111,35 @@ def is_v1_endpoint(endpoint: str) -> bool:
     return endpoint.rstrip("/").endswith("/openai/v1")
 
 
+def is_retryable_status(status: int) -> bool:
+    return status in {408, 429} or status >= 500
+
+
+def retry_delay(attempt: int, retry_after: str | None = None) -> float:
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0), MAX_RETRY_DELAY_SECONDS)
+        except ValueError:
+            pass
+    return min(2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS)
+
+
+def wait_before_retry(
+    method: str,
+    url: str,
+    attempt: int,
+    reason: str,
+    retry_after: str | None = None,
+) -> None:
+    delay = retry_delay(attempt, retry_after)
+    print(
+        f"{method} {url} failed ({reason}); retrying in {delay:g}s "
+        f"({attempt}/{MAX_REQUEST_ATTEMPTS}).",
+        file=sys.stderr,
+    )
+    time.sleep(delay)
+
+
 def request_json(
     url: str,
     *,
@@ -121,16 +155,41 @@ def request_json(
         request_headers["Content-Type"] = "application/json"
 
     request = Request(url, data=data, headers=request_headers, method=method)
-    try:
-        with urlopen(request, timeout=60) as response:
-            body = response.read().decode("utf-8")
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
-        raise RequestError(method, url, error.code, body) from error
-    except URLError as error:
-        raise RuntimeError(f"{method} {url} failed: {error.reason}") from error
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            with urlopen(request, timeout=60) as response:
+                body = response.read().decode("utf-8")
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            if is_retryable_status(error.code) and attempt < MAX_REQUEST_ATTEMPTS:
+                wait_before_retry(
+                    method,
+                    url,
+                    attempt,
+                    f"HTTP {error.code}",
+                    error.headers.get("Retry-After"),
+                )
+                continue
+            raise RequestError(method, url, error.code, body) from error
+        except (TimeoutError, URLError) as error:
+            if attempt < MAX_REQUEST_ATTEMPTS:
+                reason = getattr(error, "reason", error)
+                wait_before_retry(method, url, attempt, str(reason))
+                continue
+            reason = getattr(error, "reason", error)
+            raise RuntimeError(f"{method} {url} failed: {reason}") from error
 
-    return json.loads(body) if body else None
+        if not body:
+            return None
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as error:
+            if attempt < MAX_REQUEST_ATTEMPTS:
+                wait_before_retry(method, url, attempt, "invalid JSON response")
+                continue
+            raise RuntimeError(f"{method} {url} returned invalid JSON") from error
+
+    raise AssertionError("unreachable")
 
 
 def github_headers(token: str) -> dict[str, str]:
@@ -224,37 +283,75 @@ def generate_description(config: Config, prompt: str, request: JsonRequest) -> s
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "max_completion_tokens": MAX_COMPLETION_TOKENS,
+        "max_completion_tokens": INITIAL_COMPLETION_TOKENS,
     }
     if is_v1_endpoint(config.azure_openai_endpoint):
         payload["model"] = config.azure_openai_deployment
     headers = {"api-key": config.azure_openai_api_key}
 
-    try:
-        response = request(
-            azure_completions_url(config),
-            method="POST",
-            headers=headers,
-            payload=payload,
-        )
-    except RequestError as error:
-        if error.status != 400 or "max_completion_tokens" not in error.body:
-            raise
-        payload["max_tokens"] = payload.pop("max_completion_tokens")
-        response = request(
-            azure_completions_url(config),
-            method="POST",
-            headers=headers,
-            payload=payload,
+    for attempt in range(1, MAX_COMPLETION_ATTEMPTS + 1):
+        try:
+            response = request(
+                azure_completions_url(config),
+                method="POST",
+                headers=headers,
+                payload=payload,
+            )
+        except RequestError as error:
+            if error.status != 400 or "max_completion_tokens" not in error.body:
+                raise
+            payload["max_tokens"] = payload.pop("max_completion_tokens")
+            response = request(
+                azure_completions_url(config),
+                method="POST",
+                headers=headers,
+                payload=payload,
+            )
+
+        try:
+            choice = response["choices"][0]
+            content = choice["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise RuntimeError(
+                "Azure OpenAI returned an invalid completion response"
+            ) from error
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+        finish_reason = choice.get("finish_reason")
+        if finish_reason == "content_filter":
+            raise RuntimeError(
+                "Azure OpenAI filtered the generated pull request description"
+            )
+        if attempt == MAX_COMPLETION_ATTEMPTS:
+            reason = (
+                f" (finish reason: {finish_reason})"
+                if isinstance(finish_reason, str) and finish_reason
+                else ""
+            )
+            raise RuntimeError(
+                "Azure OpenAI returned an empty description after "
+                f"{MAX_COMPLETION_ATTEMPTS} attempts{reason}"
+            )
+
+        if finish_reason == "length":
+            token_parameter = (
+                "max_completion_tokens"
+                if "max_completion_tokens" in payload
+                else "max_tokens"
+            )
+            payload[token_parameter] = min(
+                payload[token_parameter] * 2,
+                MAX_COMPLETION_TOKENS,
+            )
+        print(
+            "Azure OpenAI returned an empty description"
+            f" (attempt {attempt}/{MAX_COMPLETION_ATTEMPTS}, "
+            f"finish reason: {finish_reason or 'unknown'}); retrying.",
+            file=sys.stderr,
         )
 
-    try:
-        content = response["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as error:
-        raise RuntimeError("Azure OpenAI returned an invalid completion response") from error
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("Azure OpenAI returned an empty description")
-    return content.strip()
+    raise AssertionError("unreachable")
 
 
 def format_description(generated: str, pull_request_url: str) -> str:
