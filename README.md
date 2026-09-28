@@ -163,14 +163,6 @@ caller's `GITHUB_TOKEN`, but it cannot elevate a caller whose permission ceiling
 is read-only. The repository's default workflow permission may remain `read`;
 the explicit caller grant above applies only to this release workflow.
 
-If an existing package does not grant the calling repository write access, first
-prefer adding the repository under the package's **Manage Actions access**
-settings. When that is not possible, set `use_registry_token_auth: true` and
-inherit `USERNAME` and `TOKEN` secrets for an account whose token has
-`write:packages`; the repository-scoped `GITHUB_TOKEN` remains the default.
-For manual retries, pass the release tag as both `tag` and `checkout_ref` so the
-image is rebuilt from the exact source revision being republished.
-
 ## Release bump example
 
 `release-bump.yml` determines the next semantic version from the latest `v*` tag, creates a GitHub release with generated notes, and exposes the new tag as the `tag` output. Because a release created with the default `GITHUB_TOKEN` does not emit a `release: created` event, chain `release-create.yml` directly after it.
