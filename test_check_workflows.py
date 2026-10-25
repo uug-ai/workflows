@@ -1,4 +1,7 @@
 import copy
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 from check_workflows import WORKFLOWS_DIR, load_yaml, validate_release_workflow
@@ -67,6 +70,30 @@ class ReleaseContractsTest(unittest.TestCase):
                     if step.get("name") == name:
                         step["with"][key] = step["with"][key].replace("-platform", "")
                 self.assertTrue(self.errors(workflow))
+
+    def test_runtime_file_gates_reject_shells_and_special_permissions(self):
+        inspection = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Inspect image contract"
+        )
+        gates = inspection[inspection.index("if grep -E"):]
+        for files, permissions, expected in (
+            ("app/main\nusr/lib/libc.so.6\n", "-r-xr-xr-x root/root app/main\n", 0),
+            ("app/main\nbin/sh\n", "-r-xr-xr-x root/root app/main\n", 1),
+            ("app/main\n", "-rwsr-xr-x root/root app/main\n", 1),
+            ("app/main\n", "-r-xr-sr-x root/root app/main\n", 1),
+        ):
+            with self.subTest(files=files, permissions=permissions):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "rootfs-files.txt").write_text(files)
+                    (root / "rootfs-permissions.txt").write_text(permissions)
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", gates], cwd=root, capture_output=True, text=True
+                    )
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    if expected:
+                        self.assertIn("::error::", result.stdout)
 
     def test_validation_only_cannot_push_or_promote(self):
         self.workflow["jobs"]["hardened-manifest"]["if"] = "inputs.hardened"

@@ -267,9 +267,11 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
-          echo "version=${RELEASE_TAG:-dev}" >> "$GITHUB_OUTPUT"
-          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "created=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=${RELEASE_TAG:-dev}"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "created=$(git show -s --format=%cI HEAD)"
+          } >> "$GITHUB_OUTPUT"
       - name: Build final image for inspection
         uses: docker/build-push-action@v6
         with:
@@ -290,9 +292,15 @@ jobs:
           docker export "$container" -o rootfs.tar
           docker rm "$container"
           tar -tf rootfs.tar > rootfs-files.txt
-          ! grep -E '(^|/)(s?bin)/(sh|bash|curl|wget|apt|apk|gcc|go)$' rootfs-files.txt
           tar -tvf rootfs.tar > rootfs-permissions.txt
-          ! grep -E '^[-dlcbp][rwxStTs-]{2}[sS]|^[-dlcbp][rwxStTs-]{5}[sS]' rootfs-permissions.txt
+          if grep -E '(^|/)(s?bin)/(sh|bash|curl|wget|apt|apk|gcc|go)$' rootfs-files.txt; then
+            echo "::error::runtime contains a prohibited shell, utility or build tool"
+            exit 1
+          fi
+          if grep -E '^[-dlcbp][rwxStTs-]{2}[sS]|^[-dlcbp][rwxStTs-]{5}[sS]' rootfs-permissions.txt; then
+            echo "::error::runtime contains a setuid or setgid executable"
+            exit 1
+          fi
       - name: Smoke test with a read-only filesystem and no capabilities
         env:
           CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -306,6 +314,7 @@ jobs:
             -e RABBITMQ_USERNAME=ci -e RABBITMQ_PASSWORD="$CI_PASSWORD" hardened:scan
           ready=false
           for attempt in $(seq 1 30); do
+            echo "Smoke readiness attempt $attempt/30"
             if curl --fail --max-time 2 http://127.0.0.1:8080/metrics > /dev/null &&
               docker exec "${{ job.services.rabbitmq.id }}" rabbitmqctl list_queues name consumers |
                 awk -v queue="$SMOKE_QUEUE" '$1 == queue && $2 == 1 { found = 1 } END { exit !found }'; then
