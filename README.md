@@ -163,6 +163,65 @@ caller's `GITHUB_TOKEN`, but it cannot elevate a caller whose permission ceiling
 is read-only. The repository's default workflow permission may remain `read`;
 the explicit caller grant above applies only to this release workflow.
 
+### Hardened Go worker releases
+
+The existing `release-create.yml` also owns the hardened release path; callers
+do not need a separate image-hardening workflow. It is opt-in so existing
+services retain their current Dockerfile, authentication and permission behavior.
+
+Set `hardened: true`, `use_private_module_auth: false` and the worker's
+`smoke_queue`. Grant the calling release job `contents: read`, `packages: write`
+and `id-token: write`. The signing job inherits the caller's OIDC grant; legacy
+callers are not required to grant it. Set the native `runner_matrix` explicitly
+when using GitHub-hosted arm64 runners.
+
+This profile expects a Dockerfile `test` stage running native tests and
+source/binary reachability checks, an image running as `65532:65532` with
+entrypoint `/app/main`, and a MongoDB/RabbitMQ worker exposing `/metrics` on
+port 8080. Builds, read-only/no-capability smoke tests, source secret/config
+checks, and medium/high/critical image gates precede publishing. Native registry
+rescans use the explicit platform. SBOMs, maximum provenance and verified
+keyless signatures precede GitOps promotion. All evidence remains in Actions
+artifacts; signing identities use
+`https://github.com/uug-ai/workflows/.github/workflows/release-create.yml@refs/...`.
+Native images retain the existing package layout:
+`ghcr.io/<organization>/<project>-platform:<architecture>-<tag>`.
+The version and `latest` manifests in `ghcr.io/<organization>/<project>` are
+assembled from those native package digests; the unsuffixed package is not used
+as the native architecture-tag destination.
+
+```yaml
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  release:
+    uses: uug-ai/workflows/.github/workflows/release-create.yml@main
+    with:
+      tag: ${{ github.event.release.tag_name }}
+      hardened: true
+      use_private_module_auth: false
+      smoke_queue: kcloud-monitor-queue
+      runner_matrix: >-
+        [
+          {"architecture":"amd64","runner":"ubuntu-24.04"},
+          {"architecture":"arm64","runner":"ubuntu-24.04-arm"}
+        ]
+      create_gitops_pr: true
+      gitops_key: kerberospipeline.monitor.tag
+    secrets: inherit
+```
+
+The same call belongs after `needs: bump-release` in the bump wrapper, using
+`needs.bump-release.outputs.tag`. For pull-request or push validation, set
+`publish: false` and leave `create_gitops_pr: false`; neither manifests,
+signatures, registry writes nor deployment proposals are produced. A manual
+caller can pass an existing release tag to retry publication without a new
+version or moving the source tag. Hardened builds currently support public
+modules only and never accept credential build arguments.
+
 ## Release bump example
 
 `release-bump.yml` determines the next semantic version from the latest `v*` tag, creates a GitHub release with generated notes, and exposes the new tag as the `tag` output. Because a release created with the default `GITHUB_TOKEN` does not emit a `release: created` event, chain `release-create.yml` directly after it.

@@ -123,6 +123,80 @@ def validate_pr_description_action(errors: list[str]) -> None:
         errors.append("PR description workflow must use the first-party action")
 
 
+def validate_release_workflow(data: dict, errors: list[str]) -> None:
+    inputs = data["on"]["workflow_call"]["inputs"]
+    if inputs["hardened"]["default"] is not False:
+        errors.append("release-create.yml: hardening must remain opt-in")
+    if inputs["publish"]["default"] is not True:
+        errors.append("release-create.yml: existing callers must still publish")
+    if "id-token" in data.get("permissions", {}):
+        errors.append("release-create.yml: legacy callers must not require OIDC")
+
+    jobs = data["jobs"]
+    for job_id in ("build", "create-manifest"):
+        if jobs[job_id]["if"] != "${{ !inputs.hardened && inputs.publish }}":
+            errors.append(f"release-create.yml: {job_id} must isolate legacy builds")
+    if jobs["hardened-source"]["if"] != "inputs.hardened":
+        errors.append("release-create.yml: source gates must be opt-in")
+    images = jobs["hardened-images"]
+    if images["needs"] != "hardened-source":
+        errors.append("release-create.yml: images must require source gates")
+    if images["env"].get("TRIVY_PLATFORM") != "linux/${{ matrix.architecture }}":
+        errors.append("release-create.yml: registry scans must use the native platform")
+    steps = images["steps"]
+    names = [step.get("name") for step in steps]
+    required_order = [
+        "Run native tests and vulnerability reachability checks",
+        "Inspect image contract",
+        "Smoke test with a read-only filesystem and no capabilities",
+        "Enforce vulnerability and secret policy",
+        "Publish verified image with provenance and SBOM",
+        "Scan immutable published image",
+        "Gate immutable published image",
+        "Record immutable digest and base references",
+    ]
+    if any(name not in names for name in required_order):
+        errors.append("release-create.yml: missing required hardened image gate")
+    elif [names.index(name) for name in required_order] != sorted(
+        names.index(name) for name in required_order
+    ):
+        errors.append("release-create.yml: hardened gates must precede promotion")
+    for step in steps:
+        name = step.get("name")
+        if name == "Publish verified image with provenance and SBOM":
+            if step["with"].get("provenance") != "mode=max" or step["with"].get("sbom") is not True:
+                errors.append("release-create.yml: publishing requires provenance and SBOM")
+            if step["with"].get("tags") != (
+                "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform:"
+                "${{ matrix.architecture }}-${{ env.TAG }}"
+            ):
+                errors.append("release-create.yml: native images must use the -platform package")
+        if name == "Scan immutable published image" and step["with"].get("image-ref") != (
+            "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform@"
+            "${{ steps.publish.outputs.digest }}"
+        ):
+            errors.append("release-create.yml: immutable scans must inspect the -platform package")
+        if name in required_order[4:] and step.get("if") != "inputs.publish":
+            errors.append(f"release-create.yml: {name} must respect validation-only mode")
+
+    manifest = jobs["hardened-manifest"]
+    if manifest["needs"] != "hardened-images" or manifest["if"] != "inputs.hardened && inputs.publish":
+        errors.append("release-create.yml: signing must require successful image gates")
+    if "id-token" in manifest.get("permissions", {}):
+        errors.append("release-create.yml: signing must inherit the caller's optional OIDC grant")
+    signing = next(step for step in manifest["steps"] if step.get("name") == "Publish and sign immutable multi-platform manifest")
+    if signing["env"].get("PLATFORM_IMAGE") != "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform":
+        errors.append("release-create.yml: manifests must reference the native package")
+    promotion = jobs["update-gitops"]
+    if promotion["needs"] != ["create-manifest", "hardened-manifest"]:
+        errors.append("release-create.yml: GitOps must wait for either manifest path")
+    if promotion["if"] != (
+        "${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && "
+        "(needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}"
+    ):
+        errors.append("release-create.yml: GitOps must require successful publication")
+
+
 def main() -> int:
     errors: list[str] = []
     workflow_names = {path.name for path in WORKFLOWS_DIR.glob("*.yml")}
@@ -137,6 +211,7 @@ def main() -> int:
 
     validate_readme(errors)
     validate_pr_description_action(errors)
+    validate_release_workflow(load_yaml(WORKFLOWS_DIR / "release-create.yml"), errors)
 
     if errors:
         for message in errors:
