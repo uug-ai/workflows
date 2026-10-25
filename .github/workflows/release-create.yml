@@ -22,6 +22,18 @@ on:
         required: false
         type: string
         default: '.'
+      hardened:
+        description: 'Enforce the non-root /app/main Go worker image contract, tests, scans, provenance and signing'
+        type: boolean
+        default: false
+      publish:
+        description: 'Publish verified images; false runs hardened validation only'
+        type: boolean
+        default: true
+      smoke_queue:
+        description: 'RabbitMQ consumer queue required by the hardened MongoDB/RabbitMQ worker smoke test'
+        type: string
+        default: ''
       use_private_module_auth:
         description: 'Whether to pass GitHub credentials to Docker for private module downloads'
         required: false
@@ -83,10 +95,6 @@ on:
       TOKEN:
         required: false
 
-permissions:
-  contents: read
-  packages: write
-
 env:
   ORGANIZATION: ${{ inputs.organization || 'uug-ai' }}
   PROJECT: ${{ inputs.project || github.event.repository.name }}
@@ -105,6 +113,10 @@ env:
 jobs:
 
   build:
+    if: ${{ !inputs.hardened && inputs.publish }}
+    permissions:
+      contents: read
+      packages: write
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -137,6 +149,10 @@ jobs:
           docker push "ghcr.io/$ORGANIZATION/$PROJECT-platform:${{ matrix.architecture }}-${{ env.TAG }}"
 
   create-manifest:
+    if: ${{ !inputs.hardened && inputs.publish }}
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-24.04
     needs: [build]
     steps:
@@ -167,10 +183,281 @@ jobs:
           docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:latest" "${image_refs[@]}"
           docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:latest"
 
-  update-gitops:
+  hardened-source:
+    if: inputs.hardened
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
-    needs: [create-manifest]
-    if: ${{ inputs.create_gitops_pr }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+      - name: Validate hardened release configuration
+        env:
+          SMOKE_QUEUE: ${{ inputs.smoke_queue }}
+          PRIVATE_MODULE_AUTH: ${{ inputs.use_private_module_auth }}
+          PUBLISH: ${{ inputs.publish }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          if [ -z "$SMOKE_QUEUE" ]; then
+            echo "::error::hardened releases require smoke_queue"
+            exit 1
+          fi
+          if [ "$PRIVATE_MODULE_AUTH" != false ]; then
+            echo "::error::hardened releases require use_private_module_auth=false; credential build arguments are not supported"
+            exit 1
+          fi
+          if [ "$PUBLISH" = true ] && [ -z "$RELEASE_TAG" ]; then
+            echo "::error::publishing a hardened image requires an explicit release tag"
+            exit 1
+          fi
+      - name: Scan repository secrets and configuration
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          version: v0.76.1
+          scan-type: fs
+          scanners: secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: json
+          output: source-security.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hardened-source
+          path: source-security.json
+
+  hardened-images:
+    needs: hardened-source
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TRIVY_PLATFORM: linux/${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(inputs.runner_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    services:
+      mongodb:
+        image: mongo:8
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      rabbitmq:
+        image: rabbitmq:4-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: ci
+          RABBITMQ_DEFAULT_PASS: ${{ github.run_id }}-${{ github.run_attempt }}
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Run native tests and vulnerability reachability checks
+        run: docker buildx build --target test --progress=plain "$BUILD_CONTEXT"
+      - name: Release metadata
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          {
+            echo "version=${RELEASE_TAG:-dev}"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "created=$(git show -s --format=%cI HEAD)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build final image for inspection
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.docker_context }}
+          load: true
+          tags: hardened:scan
+          build-args: |
+            VERSION=${{ steps.metadata.outputs.version }}
+            REVISION=${{ steps.metadata.outputs.revision }}
+            CREATED=${{ steps.metadata.outputs.created }}
+      - name: Inspect image contract
+        run: |
+          docker image inspect hardened:scan > image-inspect.json
+          test "$(docker image inspect hardened:scan --format '{{.Config.User}}')" = 65532:65532
+          test "$(docker image inspect hardened:scan --format '{{.Architecture}}')" = "${{ matrix.architecture }}"
+          test "$(docker image inspect hardened:scan --format '{{json .Config.Entrypoint}}')" = '["/app/main"]'
+          container=$(docker create hardened:scan)
+          docker export "$container" -o rootfs.tar
+          docker rm "$container"
+          tar -tf rootfs.tar > rootfs-files.txt
+          tar -tvf rootfs.tar > rootfs-permissions.txt
+          if grep -E '(^|/)(s?bin)/(sh|bash|curl|wget|apt|apk|gcc|go)$' rootfs-files.txt; then
+            echo "::error::runtime contains a prohibited shell, utility or build tool"
+            exit 1
+          fi
+          if grep -E '^[-dlcbp][rwxStTs-]{2}[sS]|^[-dlcbp][rwxStTs-]{5}[sS]' rootfs-permissions.txt; then
+            echo "::error::runtime contains a setuid or setgid executable"
+            exit 1
+          fi
+      - name: Smoke test with a read-only filesystem and no capabilities
+        env:
+          CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          SMOKE_QUEUE: ${{ inputs.smoke_queue }}
+        run: |
+          docker run -d --name hardened-smoke --network host --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -e MONGODB_URI=mongodb://127.0.0.1:27017 \
+            -e MONGODB_DATABASE_CLOUD=Kerberos \
+            -e RABBITMQ_HOST=127.0.0.1:5672 -e RABBITMQ_EXCHANGE=ci \
+            -e RABBITMQ_USERNAME=ci -e RABBITMQ_PASSWORD="$CI_PASSWORD" hardened:scan
+          ready=false
+          for attempt in $(seq 1 30); do
+            echo "Smoke readiness attempt $attempt/30"
+            if curl --fail --max-time 2 http://127.0.0.1:8080/metrics > /dev/null &&
+              docker exec "${{ job.services.rabbitmq.id }}" rabbitmqctl list_queues name consumers |
+                awk -v queue="$SMOKE_QUEUE" '$1 == queue && $2 == 1 { found = 1 } END { exit !found }'; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          docker logs hardened-smoke > smoke.log 2>&1
+          docker rm -f hardened-smoke
+          test "$ready" = true
+      - name: Scan final image
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          version: v0.76.1
+          image-ref: hardened:scan
+          scanners: vuln,secret
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          trivyignores: ""
+          format: json
+          output: image-security.json
+          exit-code: "0"
+      - name: Enforce vulnerability and secret policy
+        run: |
+          jq -e '[.Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' image-security.json
+      - name: Generate SPDX SBOM
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          version: v0.76.1
+          image-ref: hardened:scan
+          format: spdx-json
+          output: image.spdx.json
+      - uses: docker/login-action@v3
+        if: inputs.publish
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish verified image with provenance and SBOM
+        if: inputs.publish
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.docker_context }}
+          push: true
+          tags: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform:${{ matrix.architecture }}-${{ env.TAG }}
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            VERSION=${{ steps.metadata.outputs.version }}
+            REVISION=${{ steps.metadata.outputs.revision }}
+            CREATED=${{ steps.metadata.outputs.created }}
+      - name: Scan immutable published image
+        if: inputs.publish
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          version: v0.76.1
+          image-ref: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform@${{ steps.publish.outputs.digest }}
+          scanners: vuln,secret
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          trivyignores: ""
+          format: json
+          output: published-image-security.json
+          exit-code: "0"
+      - name: Gate immutable published image
+        if: inputs.publish
+        run: |
+          jq -e '[.Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' published-image-security.json
+      - name: Record immutable digest and base references
+        if: inputs.publish
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          printf '%s\n' "$DIGEST" > digest-${{ matrix.architecture }}.txt
+          grep '^FROM ' "$BUILD_CONTEXT/Dockerfile" > base-images.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hardened-image-${{ matrix.architecture }}
+          path: |
+            image-security.json
+            published-image-security.json
+            image.spdx.json
+            image-inspect.json
+            rootfs-files.txt
+            rootfs-permissions.txt
+            digest-*.txt
+            base-images.txt
+            smoke.log
+
+  hardened-manifest:
+    if: inputs.hardened && inputs.publish
+    needs: hardened-images
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hardened-image-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: sigstore/cosign-installer@v3
+      - name: Publish and sign immutable multi-platform manifest
+        env:
+          IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}
+          PLATFORM_IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform
+        run: |
+          image_refs=()
+          for file in digest-*.txt; do
+            test -f "$file"
+            image_refs+=("$PLATFORM_IMAGE@$(cat "$file")")
+          done
+          docker buildx imagetools create -t "$IMAGE:$TAG" "${image_refs[@]}"
+          docker buildx imagetools inspect "$IMAGE:$TAG" --raw > manifest.json
+          digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          cosign sign --yes "$IMAGE@$digest"
+          cosign verify \
+            --certificate-identity-regexp '^https://github.com/uug-ai/workflows/.github/workflows/release-create.yml@refs/.*$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE@$digest" > signature-verification.json
+          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE@$digest"
+          echo "$IMAGE@$digest" | tee image-digest.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hardened-release
+          path: |
+            manifest.json
+            image-digest.txt
+            signature-verification.json
+
+  update-gitops:
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    needs: [create-manifest, hardened-manifest]
+    if: ${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && (needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}
     steps:
       # After we build the Docker image, we create a pull request to update the GitOps repository
       # This will allow us to update the Helm chart with the new Docker image tag.
