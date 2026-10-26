@@ -26,6 +26,10 @@ on:
         description: 'Enforce the non-root /app/main Go worker image contract, tests, scans, provenance and signing'
         type: boolean
         default: false
+      hardened_profile:
+        description: 'Hardened image contract: worker or frontend (nginx, runtime config and /tmp tmpfs)'
+        type: string
+        default: worker
       publish:
         description: 'Publish verified images; false runs hardened validation only'
         type: boolean
@@ -202,8 +206,13 @@ jobs:
           PRIVATE_MODULE_AUTH: ${{ inputs.use_private_module_auth }}
           PUBLISH: ${{ inputs.publish }}
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          PROFILE: ${{ inputs.hardened_profile }}
         run: |
-          if [ -z "$SMOKE_QUEUE" ]; then
+          if [ "$PROFILE" != worker ] && [ "$PROFILE" != frontend ]; then
+            echo "::error::unknown hardened image profile: $PROFILE"
+            exit 1
+          fi
+          if [ "$PROFILE" = worker ] && [ -z "$SMOKE_QUEUE" ]; then
             echo "::error::hardened releases require smoke_queue"
             exit 1
           fi
@@ -245,13 +254,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     services:
       mongodb:
-        image: mongo:8
+        image: ${{ inputs.hardened_profile == 'worker' && 'mongo:8' || '' }}
         ports: ["27017:27017"]
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
           --health-interval 5s --health-timeout 5s --health-retries 20
       rabbitmq:
-        image: rabbitmq:4-alpine
+        image: ${{ inputs.hardened_profile == 'worker' && 'rabbitmq:4-alpine' || '' }}
         env:
           RABBITMQ_DEFAULT_USER: ci
           RABBITMQ_DEFAULT_PASS: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -287,6 +296,8 @@ jobs:
             REVISION=${{ steps.metadata.outputs.revision }}
             CREATED=${{ steps.metadata.outputs.created }}
       - name: Inspect image contract
+        env:
+          PROFILE: ${{ inputs.hardened_profile }}
         run: |
           docker image inspect hardened:scan > image-inspect.json
           test "$(docker image inspect hardened:scan --format '{{.Config.User}}')" = 65532:65532
@@ -297,6 +308,11 @@ jobs:
           docker rm "$container"
           tar -tf rootfs.tar > rootfs-files.txt
           tar -tvf rootfs.tar > rootfs-permissions.txt
+          if [ "$PROFILE" = frontend ]; then
+            mkdir frontend-inventory
+            tar -xOf rootfs.tar usr/share/frontend/package.json > frontend-inventory/package.json
+            tar -xOf rootfs.tar usr/share/frontend/package-lock.json > frontend-inventory/package-lock.json
+          fi
           if grep -E '(^|/)(s?bin)/(sh|bash|curl|wget|apt|apk|gcc|go)$' rootfs-files.txt; then
             echo "::error::runtime contains a prohibited shell, utility or build tool"
             exit 1
@@ -306,6 +322,7 @@ jobs:
             exit 1
           fi
       - name: Smoke test with a read-only filesystem and no capabilities
+        if: inputs.hardened_profile == 'worker'
         env:
           CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
           SMOKE_QUEUE: ${{ inputs.smoke_queue }}
@@ -330,6 +347,9 @@ jobs:
           docker logs hardened-smoke > smoke.log 2>&1
           docker rm -f hardened-smoke
           test "$ready" = true
+      - name: Smoke test frontend routing and runtime configuration
+        if: inputs.hardened_profile == 'frontend'
+        run: bash image/smoke-test.sh hardened:scan
       - name: Scan final image
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
@@ -342,9 +362,20 @@ jobs:
           format: json
           output: image-security.json
           exit-code: "0"
-      - name: Enforce vulnerability and secret policy
-        run: |
-          jq -e '[.Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' image-security.json
+      - name: Scan browser dependency inventory
+        if: inputs.hardened_profile == 'frontend'
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          version: v0.76.1
+          scan-type: fs
+          scan-ref: frontend-inventory
+          scanners: vuln
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          trivyignores: ""
+          format: json
+          output: browser-security.json
+          exit-code: "0"
       - name: Generate SPDX SBOM
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
@@ -352,6 +383,24 @@ jobs:
           image-ref: hardened:scan
           format: spdx-json
           output: image.spdx.json
+      - name: Generate browser dependency SPDX SBOM
+        if: inputs.hardened_profile == 'frontend'
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          version: v0.76.1
+          scan-type: fs
+          scan-ref: frontend-inventory
+          format: spdx-json
+          output: browser.spdx.json
+      - name: Enforce vulnerability and secret policy
+        env:
+          PROFILE: ${{ inputs.hardened_profile }}
+        run: |
+          reports=(image-security.json)
+          if [ "$PROFILE" = frontend ]; then
+            reports+=(browser-security.json)
+          fi
+          jq -se '[.[].Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' "${reports[@]}"
       - uses: docker/login-action@v3
         if: inputs.publish
         with:
@@ -402,8 +451,11 @@ jobs:
           name: hardened-image-${{ matrix.architecture }}
           path: |
             image-security.json
+            browser-security.json
             published-image-security.json
             image.spdx.json
+            browser.spdx.json
+            frontend-inventory
             image-inspect.json
             rootfs-files.txt
             rootfs-permissions.txt

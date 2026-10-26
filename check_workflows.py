@@ -131,6 +131,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: existing callers must still publish")
     if inputs["finalize_release"]["default"] is not False:
         errors.append("release-create.yml: draft finalization must remain opt-in")
+    if inputs["hardened_profile"]["default"] != "worker":
+        errors.append("release-create.yml: existing hardened callers must retain the worker profile")
     if "id-token" in data.get("permissions", {}):
         errors.append("release-create.yml: legacy callers must not require OIDC")
 
@@ -146,11 +148,37 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     if images["env"].get("TRIVY_PLATFORM") != "linux/${{ matrix.architecture }}":
         errors.append("release-create.yml: registry scans must use the native platform")
     steps = images["steps"]
+    worker_smoke = next(
+        (step for step in steps if step.get("name") == "Smoke test with a read-only filesystem and no capabilities"),
+        {},
+    )
+    frontend_smoke = next(
+        (step for step in steps if step.get("name") == "Smoke test frontend routing and runtime configuration"),
+        {},
+    )
+    if worker_smoke.get("if") != "inputs.hardened_profile == 'worker'":
+        errors.append("release-create.yml: worker smoke checks must be profile-specific")
+    if frontend_smoke.get("if") != "inputs.hardened_profile == 'frontend'":
+        errors.append("release-create.yml: frontend routing/configuration smoke checks are required")
+    if frontend_smoke.get("run") != "bash image/smoke-test.sh hardened:scan":
+        errors.append("release-create.yml: frontend checks must exercise the built image")
+    browser_scan = next(
+        (step for step in steps if step.get("name") == "Scan browser dependency inventory"),
+        {},
+    )
+    if (
+        browser_scan.get("if") != "inputs.hardened_profile == 'frontend'"
+        or browser_scan.get("with", {}).get("scan-ref") != "frontend-inventory"
+        or browser_scan.get("with", {}).get("scan-type") != "fs"
+    ):
+        errors.append("release-create.yml: browser lock inventory extracted from the image must be scanned")
     names = [step.get("name") for step in steps]
     required_order = [
         "Run native tests and vulnerability reachability checks",
         "Inspect image contract",
         "Smoke test with a read-only filesystem and no capabilities",
+        "Smoke test frontend routing and runtime configuration",
+        "Scan browser dependency inventory",
         "Enforce vulnerability and secret policy",
         "Publish staged image with provenance and SBOM",
         "Scan immutable published image",
@@ -178,7 +206,7 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
             "${{ steps.publish.outputs.digest }}"
         ):
             errors.append("release-create.yml: immutable scans must inspect the -platform package")
-        if name in required_order[4:] and step.get("if") != "inputs.publish":
+        if name in required_order[required_order.index("Publish staged image with provenance and SBOM"):] and step.get("if") != "inputs.publish":
             errors.append(f"release-create.yml: {name} must respect validation-only mode")
 
     manifest = jobs["hardened-manifest"]
