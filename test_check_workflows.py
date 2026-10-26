@@ -41,6 +41,46 @@ class ReleaseContractsTest(unittest.TestCase):
         self.workflow["on"]["workflow_call"]["inputs"]["hardened_profile"]["default"] = "frontend"
         self.assertTrue(self.errors(self.workflow))
 
+    def test_existing_entrypoint_is_the_compatible_default(self):
+        self.workflow["on"]["workflow_call"]["inputs"]["hardened_entrypoint"]["default"] = '["./other"]'
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_worker_smoke_must_select_the_tested_transport(self):
+        for step in self.workflow["jobs"]["hardened-images"]["steps"]:
+            if step.get("name") == "Smoke test with a read-only filesystem and no capabilities":
+                step["run"] = step["run"].replace("-e QUEUE_SYSTEM=RABBITMQ", "")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_entrypoint_inspection_cannot_ignore_the_declared_contract(self):
+        for step in self.workflow["jobs"]["hardened-images"]["steps"]:
+            if step.get("name") == "Inspect image contract":
+                step["env"].pop("EXPECTED_ENTRYPOINT")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_entrypoint_inspection_matches_the_image_not_just_valid_json(self):
+        inspection = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Inspect image contract"
+        )
+        assertion = next(
+            line for line in inspection.splitlines()
+            if "{{json .Config.Entrypoint}}" in line
+        )
+        for actual, expected, status in (
+            ('["/app/main"]', '["/app/main"]', 0),
+            ('["./hub-pipeline-counting"]', '[ "./hub-pipeline-counting" ]', 0),
+            ('["/app/main"]', '["./hub-pipeline-counting"]', 1),
+            ('null', '["/app/main"]', 1),
+        ):
+            with self.subTest(actual=actual, expected=expected):
+                result = subprocess.run(
+                    ["bash", "-e", "-c",
+                     'docker() { printf "%s\\n" "$ACTUAL_ENTRYPOINT"; }\n' + assertion],
+                    env=dict(os.environ, ACTUAL_ENTRYPOINT=actual, EXPECTED_ENTRYPOINT=expected),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
     def test_frontend_smoke_test_cannot_be_missing_or_unconditional(self):
         for condition in (None, "always()"):
             with self.subTest(condition=condition):
@@ -515,7 +555,7 @@ esac
             ("worker", "", "false", 1),
             ("frontend", "", "false", 0),
             ("api", "", "true", 0),
-            ("worker", "queue", "true", 1),
+            ("worker", "queue", "true", 0),
             ("frontend", "", "true", 1),
             ("unknown", "queue", "false", 1),
         ):
@@ -523,10 +563,53 @@ esac
                 result = subprocess.run(
                     ["bash", "-e", "-c", script],
                     env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE=queue,
-                             PRIVATE_MODULE_AUTH=auth, PUBLISH="false", RELEASE_TAG=""),
+                             PRIVATE_MODULE_AUTH=auth, PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="fixture-token"),
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_hardened_entrypoint_configuration_rejects_invalid_shapes(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for entrypoint, expected in (
+            ('["/app/main"]', 0),
+            ('[ "./hub-pipeline-counting" ]', 0),
+            ('[]', 1), ('null', 1), ('{}', 1), ('"main"', 1),
+            ('[""]', 1), ('[false]', 1), ('not-json', 1),
+        ):
+            with self.subTest(entrypoint=entrypoint):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, PROFILE="worker", SMOKE_QUEUE="queue",
+                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT=entrypoint, MODULE_TOKEN=""),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("::error::hardened_entrypoint", result.stdout)
+
+    def test_private_module_authentication_requires_a_token(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for profile in ("worker", "api"):
+            with self.subTest(profile=profile):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE="queue",
+                             PRIVATE_MODULE_AUTH="true", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN=""),
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires secrets.TOKEN", result.stdout)
 
 
 if __name__ == "__main__":

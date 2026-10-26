@@ -247,8 +247,20 @@ For pull-request or push validation, set
 `publish: false` and leave `create_gitops_pr: false`; neither manifests,
 signatures, registry writes nor deployment proposals are produced. A manual
 caller can pass an existing release tag to retry publication without a new
-version or moving the source tag. Hardened builds currently support public
-modules only and never accept credential build arguments.
+version or moving the source tag. Hardened builds never accept credential build
+arguments. Worker/API callers with private dependencies may opt into
+`use_private_module_auth: true`; `secrets.TOKEN` is then required and is passed
+only as a BuildKit secret. Public-module workers should continue to set it false.
+
+The expected image entrypoint defaults to `["/app/main"]`. To retain an existing
+executable path, set `hardened_entrypoint` to its JSON array, for example
+`'["./hub-pipeline-counting"]'`. Inspection must match that exact array; the
+numeric identity, runtime file gates, smoke tests and scan gates still apply.
+
+Go binaries may use `-ldflags="-w -buildid="` to omit DWARF debug information
+while retaining Go symbols and build/module information for vulnerability
+analysis. Do not add `-s` or run a stripping tool. Both source and actual-binary
+`govulncheck` remain required after applying these flags.
 
 ### Hardened frontend releases
 
@@ -262,7 +274,7 @@ configuration, SPA routing, cache policies and missing static files. Both
 profiles retain the numeric `/app/main` contract, native `test` build stage,
 source/image scans, immutable rescans, SBOM/provenance, staged promotion,
 signing and optional draft finalization. `smoke_queue` is required only for the
-worker profile; both profiles require `use_private_module_auth: false`.
+worker profile; frontend requires `use_private_module_auth: false`.
 The frontend exports `/usr/share/frontend/package.json` and `package-lock.json`
 from the inspected image to `frontend-inventory`, then scans it explicitly in
 filesystem mode and emits a browser SPDX report. An OS/library image scan alone
@@ -277,7 +289,8 @@ access to its private Go dependencies. Native test, inspection and publication
 builds pass it only as the BuildKit secret `github_token`, never a credential
 build argument. The API Dockerfile requires that secret, scopes Git credential
 lookup to GitHub and must not persist a token-bearing Git configuration.
-Worker/frontend callers retain their existing no-authentication requirements.
+Frontend retains its no-authentication requirement. Workers may use the same
+secret-based opt-in when their dependency graph includes private modules.
 
 The API profile starts MongoDB and RabbitMQ, retains the common `/app/main`,
 numeric non-root identity, scans/SBOM/provenance/signing/promotion contracts,

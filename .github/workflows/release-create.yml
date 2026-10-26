@@ -30,6 +30,10 @@ on:
         description: 'Hardened image contract: worker, frontend, or api (private modules and HTTP/MongoDB/RabbitMQ checks)'
         type: string
         default: worker
+      hardened_entrypoint:
+        description: 'Expected image Entrypoint as a JSON string array; preserves existing executable paths'
+        type: string
+        default: '["/app/main"]'
       publish:
         description: 'Publish verified images; false runs hardened validation only'
         type: boolean
@@ -207,7 +211,14 @@ jobs:
           PUBLISH: ${{ inputs.publish }}
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           PROFILE: ${{ inputs.hardened_profile }}
+          EXPECTED_ENTRYPOINT: ${{ inputs.hardened_entrypoint }}
+          MODULE_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
         run: |
+          if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' \
+            <<< "$EXPECTED_ENTRYPOINT" > /dev/null; then
+            echo "::error::hardened_entrypoint must be a non-empty JSON array of non-empty strings"
+            exit 1
+          fi
           if [ "$PROFILE" != worker ] && [ "$PROFILE" != frontend ] && [ "$PROFILE" != api ]; then
             echo "::error::unknown hardened image profile: $PROFILE"
             exit 1
@@ -216,8 +227,12 @@ jobs:
             echo "::error::hardened releases require smoke_queue"
             exit 1
           fi
-          if [ "$PRIVATE_MODULE_AUTH" != false ] && [ "$PROFILE" != api ]; then
-            echo "::error::worker/frontend releases require use_private_module_auth=false; API authentication uses BuildKit secrets"
+          if [ "$PRIVATE_MODULE_AUTH" != false ] && [ "$PROFILE" = frontend ]; then
+            echo "::error::frontend releases require use_private_module_auth=false"
+            exit 1
+          fi
+          if [ "$PRIVATE_MODULE_AUTH" = true ] && [ -z "$MODULE_TOKEN" ]; then
+            echo "::error::private module authentication requires secrets.TOKEN for BuildKit"
             exit 1
           fi
           if [ "$PUBLISH" = true ] && [ -z "$RELEASE_TAG" ]; then
@@ -306,11 +321,12 @@ jobs:
       - name: Inspect image contract
         env:
           PROFILE: ${{ inputs.hardened_profile }}
+          EXPECTED_ENTRYPOINT: ${{ inputs.hardened_entrypoint }}
         run: |
           docker image inspect hardened:scan > image-inspect.json
           test "$(docker image inspect hardened:scan --format '{{.Config.User}}')" = 65532:65532
           test "$(docker image inspect hardened:scan --format '{{.Architecture}}')" = "${{ matrix.architecture }}"
-          test "$(docker image inspect hardened:scan --format '{{json .Config.Entrypoint}}')" = '["/app/main"]'
+          test "$(docker image inspect hardened:scan --format '{{json .Config.Entrypoint}}')" = "$(jq -c . <<< "$EXPECTED_ENTRYPOINT")"
           container=$(docker create hardened:scan)
           docker export "$container" -o rootfs.tar
           docker rm "$container"
@@ -344,6 +360,7 @@ jobs:
             --cap-drop ALL --security-opt no-new-privileges \
             -e MONGODB_URI=mongodb://127.0.0.1:27017 \
             -e MONGODB_DATABASE_CLOUD=Kerberos \
+            -e QUEUE_SYSTEM=RABBITMQ \
             -e RABBITMQ_HOST=127.0.0.1:5672 -e RABBITMQ_EXCHANGE=ci \
             -e RABBITMQ_USERNAME=ci -e RABBITMQ_PASSWORD="$CI_PASSWORD" hardened:scan
           ready=false

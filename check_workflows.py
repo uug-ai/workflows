@@ -137,6 +137,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: draft finalization must remain opt-in")
     if inputs["hardened_profile"]["default"] != "worker":
         errors.append("release-create.yml: existing hardened callers must retain the worker profile")
+    if inputs.get("hardened_entrypoint", {}).get("default") != '["/app/main"]':
+        errors.append("release-create.yml: existing hardened callers must retain their entrypoint")
     if "id-token" in data.get("permissions", {}):
         errors.append("release-create.yml: legacy callers must not require OIDC")
 
@@ -152,6 +154,15 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     if images["env"].get("TRIVY_PLATFORM") != "linux/${{ matrix.architecture }}":
         errors.append("release-create.yml: registry scans must use the native platform")
     steps = images["steps"]
+    inspection = next(
+        (step for step in steps if step.get("name") == "Inspect image contract"),
+        {},
+    )
+    if (
+        inspection.get("env", {}).get("EXPECTED_ENTRYPOINT") != "${{ inputs.hardened_entrypoint }}"
+        or '$(jq -c . <<< "$EXPECTED_ENTRYPOINT")' not in inspection.get("run", "")
+    ):
+        errors.append("release-create.yml: inspection must enforce the declared image entrypoint")
     worker_smoke = next(
         (step for step in steps if step.get("name") == "Smoke test with a read-only filesystem and no capabilities"),
         {},
@@ -166,6 +177,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     )
     if worker_smoke.get("if") != "inputs.hardened_profile == 'worker'":
         errors.append("release-create.yml: worker smoke checks must be profile-specific")
+    if "-e QUEUE_SYSTEM=RABBITMQ" not in worker_smoke.get("run", ""):
+        errors.append("release-create.yml: worker smoke checks must select RabbitMQ explicitly")
     if frontend_smoke.get("if") != "inputs.hardened_profile == 'frontend'":
         errors.append("release-create.yml: frontend routing/configuration smoke checks are required")
     if frontend_smoke.get("run") != "bash image/smoke-test.sh hardened:scan":
