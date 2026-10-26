@@ -250,6 +250,20 @@ caller can pass an existing release tag to retry publication without a new
 version or moving the source tag. Hardened builds currently support public
 modules only and never accept credential build arguments.
 
+### Hardened frontend releases
+
+Set `hardened: true` and `hardened_profile: frontend` to reuse the same release
+pipeline for the Hub nginx frontend. The `worker` profile remains the default;
+existing callers and their MongoDB/RabbitMQ smoke checks are unchanged.
+The frontend profile skips those services and runs the repository's
+`image/smoke-test.sh hardened:scan` against the built image. That script must
+verify read-only/no-capability startup with `/tmp` tmpfs, port 8080, public runtime
+configuration, SPA routing, cache policies and missing static files. Both
+profiles retain the numeric `/app/main` contract, native `test` build stage,
+source/image scans, immutable rescans, SBOM/provenance, staged promotion,
+signing and optional draft finalization. `smoke_queue` is required only for the
+worker profile; both profiles require `use_private_module_auth: false`.
+
 ## Release bump example
 
 `release-bump.yml` determines the next semantic version from the latest `v*` tag, creates a GitHub release with generated notes, and exposes the new tag as the `tag` output. Its `draft` input defaults to `false` for existing callers; hardened callers should use `draft: true` and chain `release-create.yml` with `finalize_release: true`. A release created with the default `GITHUB_TOKEN` does not emit a `release: created` event, so chain the workflows directly.

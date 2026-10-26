@@ -37,6 +37,24 @@ class ReleaseContractsTest(unittest.TestCase):
         self.workflow["jobs"]["hardened-images"]["env"]["TRIVY_PLATFORM"] = "linux/amd64"
         self.assertTrue(self.errors(self.workflow))
 
+    def test_worker_profile_is_the_compatible_default(self):
+        self.workflow["on"]["workflow_call"]["inputs"]["hardened_profile"]["default"] = "frontend"
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_frontend_smoke_test_cannot_be_missing_or_unconditional(self):
+        for condition in (None, "always()"):
+            with self.subTest(condition=condition):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow["jobs"]["hardened-images"]["steps"]
+                for step in steps:
+                    if step.get("name") == "Smoke test frontend routing and runtime configuration":
+                        if condition is None:
+                            steps.remove(step)
+                        else:
+                            step["if"] = condition
+                        break
+                self.assertTrue(self.errors(workflow))
+
     def test_each_hardened_gate_is_required(self):
         steps = self.workflow["jobs"]["hardened-images"]["steps"]
         required = (
@@ -366,6 +384,27 @@ esac
         self.assertTrue(events[0].startswith("gh release create v1.2.3 "))
         self.assertNotIn("--draft", events[0])
         self.assertNotIn("--verify-tag", events[0])
+
+    def test_hardened_configuration_requires_only_profile_dependencies(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for profile, queue, expected in (
+            ("worker", "queue", 0),
+            ("worker", "", 1),
+            ("frontend", "", 0),
+            ("unknown", "queue", 1),
+        ):
+            with self.subTest(profile=profile, queue=queue):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE=queue,
+                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG=""),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
