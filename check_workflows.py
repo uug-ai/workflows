@@ -129,6 +129,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: hardening must remain opt-in")
     if inputs["publish"]["default"] is not True:
         errors.append("release-create.yml: existing callers must still publish")
+    if inputs["finalize_release"]["default"] is not False:
+        errors.append("release-create.yml: draft finalization must remain opt-in")
     if "id-token" in data.get("permissions", {}):
         errors.append("release-create.yml: legacy callers must not require OIDC")
 
@@ -150,7 +152,7 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         "Inspect image contract",
         "Smoke test with a read-only filesystem and no capabilities",
         "Enforce vulnerability and secret policy",
-        "Publish verified image with provenance and SBOM",
+        "Publish staged image with provenance and SBOM",
         "Scan immutable published image",
         "Gate immutable published image",
         "Record immutable digest and base references",
@@ -163,14 +165,14 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: hardened gates must precede promotion")
     for step in steps:
         name = step.get("name")
-        if name == "Publish verified image with provenance and SBOM":
+        if name == "Publish staged image with provenance and SBOM":
             if step["with"].get("provenance") != "mode=max" or step["with"].get("sbom") is not True:
                 errors.append("release-create.yml: publishing requires provenance and SBOM")
             if step["with"].get("tags") != (
                 "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform:"
-                "${{ matrix.architecture }}-${{ env.TAG }}"
+                "staging-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}"
             ):
-                errors.append("release-create.yml: native images must use the -platform package")
+                errors.append("release-create.yml: native images must use run-specific staging tags in the -platform package")
         if name == "Scan immutable published image" and step["with"].get("image-ref") != (
             "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform@"
             "${{ steps.publish.outputs.digest }}"
@@ -184,9 +186,46 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: signing must require successful image gates")
     if "id-token" in manifest.get("permissions", {}):
         errors.append("release-create.yml: signing must inherit the caller's optional OIDC grant")
-    signing = next(step for step in manifest["steps"] if step.get("name") == "Publish and sign immutable multi-platform manifest")
-    if signing["env"].get("PLATFORM_IMAGE") != "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform":
+    manifest_steps = manifest["steps"]
+    manifest_names = [step.get("name") for step in manifest_steps]
+    required_manifest_order = [
+        "Assemble and verify staged multi-platform manifest",
+        "Promote verified image tags",
+        "Finalize verified GitHub release",
+    ]
+    if any(name not in manifest_names for name in required_manifest_order):
+        errors.append("release-create.yml: missing staged verification, promotion or release finalization")
+    elif [manifest_names.index(name) for name in required_manifest_order] != sorted(
+        manifest_names.index(name) for name in required_manifest_order
+    ):
+        errors.append("release-create.yml: final tags and releases must follow signature verification")
+    signing = next(
+        (step for step in manifest_steps if step.get("name") == required_manifest_order[0]),
+        {},
+    )
+    if signing.get("env", {}).get("PLATFORM_IMAGE") != "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform":
         errors.append("release-create.yml: manifests must reference the native package")
+    signing_script = signing.get("run", "")
+    if 'staging="$IMAGE:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' not in signing_script:
+        errors.append("release-create.yml: unsigned manifests must use a run-specific staging tag")
+    if '"$IMAGE:$TAG"' in signing_script or '"$IMAGE:latest"' in signing_script:
+        errors.append("release-create.yml: signing must not expose final image tags")
+    finalization = next(
+        (step for step in manifest_steps if step.get("name") == required_manifest_order[2]),
+        {},
+    )
+    if finalization.get("if") != "inputs.finalize_release":
+        errors.append("release-create.yml: GitHub release finalization must remain opt-in")
+    evidence_indexes = [
+        index for index, step in enumerate(manifest_steps)
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    ]
+    if (
+        not evidence_indexes
+        or required_manifest_order[2] not in manifest_names
+        or max(evidence_indexes) >= manifest_names.index(required_manifest_order[2])
+    ):
+        errors.append("release-create.yml: release finalization must follow evidence upload")
     promotion = jobs["update-gitops"]
     if promotion["needs"] != ["create-manifest", "hardened-manifest"]:
         errors.append("release-create.yml: GitOps must wait for either manifest path")
@@ -195,6 +234,12 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         "(needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}"
     ):
         errors.append("release-create.yml: GitOps must require successful publication")
+
+
+def validate_release_bump_workflow(data: dict, errors: list[str]) -> None:
+    inputs = data["on"]["workflow_call"]["inputs"]
+    if inputs["draft"]["default"] is not False:
+        errors.append("release-bump.yml: draft creation must remain opt-in")
 
 
 def main() -> int:
@@ -212,6 +257,7 @@ def main() -> int:
     validate_readme(errors)
     validate_pr_description_action(errors)
     validate_release_workflow(load_yaml(WORKFLOWS_DIR / "release-create.yml"), errors)
+    validate_release_bump_workflow(load_yaml(WORKFLOWS_DIR / "release-bump.yml"), errors)
 
     if errors:
         for message in errors:

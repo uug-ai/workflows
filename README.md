@@ -171,7 +171,8 @@ services retain their current Dockerfile, authentication and permission behavior
 
 Set `hardened: true`, `use_private_module_auth: false` and the worker's
 `smoke_queue`. Grant the calling release job `contents: read`, `packages: write`
-and `id-token: write`. The signing job inherits the caller's OIDC grant; legacy
+and `id-token: write`, or `contents: write` when using `finalize_release: true`.
+The signing job inherits the caller's OIDC grant; legacy
 callers are not required to grant it. Set the native `runner_matrix` explicitly
 when using GitHub-hosted arm64 runners.
 
@@ -188,20 +189,31 @@ Native images retain the existing package layout:
 `ghcr.io/<organization>/<project>-platform:<architecture>-<tag>`.
 The version and `latest` manifests in `ghcr.io/<organization>/<project>` are
 assembled from those native package digests; the unsuffixed package is not used
-as the native architecture-tag destination.
+as the native architecture-tag destination. Native builds first push
+`staging-<run-id>-<attempt>-<architecture>` tags, and the assembled manifest uses
+`staging-<run-id>-<attempt>`. Final native architecture tags, the version tag and
+`latest` are assigned only after registry scans and signing/verification succeed.
+Each promoted tag must resolve to its expected digest before the job continues.
 
 ```yaml
 permissions:
-  contents: read
+  contents: write
   packages: write
   id-token: write
 
 jobs:
+  bump-release:
+    uses: uug-ai/workflows/.github/workflows/release-bump.yml@main
+    with:
+      draft: true
+
   release:
+    needs: bump-release
     uses: uug-ai/workflows/.github/workflows/release-create.yml@main
     with:
-      tag: ${{ github.event.release.tag_name }}
+      tag: ${{ needs.bump-release.outputs.tag }}
       hardened: true
+      finalize_release: true
       use_private_module_auth: false
       smoke_queue: kcloud-monitor-queue
       runner_matrix: >-
@@ -214,8 +226,24 @@ jobs:
     secrets: inherit
 ```
 
-The same call belongs after `needs: bump-release` in the bump wrapper, using
-`needs.bump-release.outputs.tag`. For pull-request or push validation, set
+This call belongs after `needs: bump-release` in a manually dispatched bump
+wrapper. Set `draft: true` on its `release-bump.yml` call: it explicitly reserves
+the source tag and creates a draft with generated notes. With
+`finalize_release: true`, the hardened release job publishes that draft only
+after all image checks, signature verification, final tag digest checks and
+release-evidence upload succeed. GitOps waits for this entire job to succeed.
+Keep the draft-release route as the sole release entrypoint; a
+`release: created` or `release: published` build trigger cannot gate a release
+that a user has already published manually.
+
+Failures before verification leave only staging image tags. A failure partway
+through promotion can leave some final aliases, but they reference verified
+images; the GitHub release remains draft. Retry with the existing source tag.
+Already-published releases remain published on retry, and their source tag is
+not moved. Registry aliases and the GitHub release cannot be updated atomically;
+the release is finalized only after every promotion succeeds.
+
+For pull-request or push validation, set
 `publish: false` and leave `create_gitops_pr: false`; neither manifests,
 signatures, registry writes nor deployment proposals are produced. A manual
 caller can pass an existing release tag to retry publication without a new
@@ -224,7 +252,7 @@ modules only and never accept credential build arguments.
 
 ## Release bump example
 
-`release-bump.yml` determines the next semantic version from the latest `v*` tag, creates a GitHub release with generated notes, and exposes the new tag as the `tag` output. Because a release created with the default `GITHUB_TOKEN` does not emit a `release: created` event, chain `release-create.yml` directly after it.
+`release-bump.yml` determines the next semantic version from the latest `v*` tag, creates a GitHub release with generated notes, and exposes the new tag as the `tag` output. Its `draft` input defaults to `false` for existing callers; hardened callers should use `draft: true` and chain `release-create.yml` with `finalize_release: true`. A release created with the default `GITHUB_TOKEN` does not emit a `release: created` event, so chain the workflows directly.
 
 ```yaml
 name: Bump release
@@ -235,9 +263,9 @@ on:
       bump:
         description: "Which part of the version to bump"
         required: true
-        default: fix
+        default: patch
         type: choice
-        options: [major, minor, fix]
+        options: [major, minor, patch]
 
 permissions:
   contents: write
@@ -264,7 +292,7 @@ jobs:
     secrets: inherit
 ```
 
-The `bump` input accepts `major`, `minor`, or `fix` and defaults to `fix`.
+The `bump` input accepts `major`, `minor`, or `patch` and defaults to `patch`.
 
 ## Manual workflow example
 

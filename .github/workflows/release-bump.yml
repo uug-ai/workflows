@@ -7,6 +7,10 @@ on:
         required: false
         type: string
         default: 'patch'
+      draft:
+        description: 'Reserve the source tag and keep the release draft until verified publication'
+        type: boolean
+        default: false
     outputs:
       tag:
         description: 'The newly created release tag'
@@ -74,9 +78,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
+          DRAFT: ${{ inputs.draft }}
         run: |
           set -euo pipefail
+          options=()
+          if [ "$DRAFT" = true ]; then
+            # Draft releases do not reliably create a checkoutable source tag.
+            git tag "$TAG" "$GITHUB_SHA"
+            git push origin "refs/tags/$TAG"
+            options+=(--draft --verify-tag)
+          fi
           gh release create "$TAG" \
             --target "$GITHUB_SHA" \
             --title "$TAG" \
-            --generate-notes
+            --generate-notes "${options[@]}"
