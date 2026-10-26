@@ -549,9 +549,11 @@ jobs:
         if: inputs.publish
         env:
           DIGEST: ${{ steps.publish.outputs.digest }}
+          DOCKERFILE: ${{ inputs.hardened_dockerfile }}
         run: |
           printf '%s\n' "$DIGEST" > digest-${{ matrix.architecture }}.txt
-          grep '^FROM ' "$BUILD_CONTEXT/Dockerfile" > base-images.txt
+          dockerfile="${DOCKERFILE:-$BUILD_CONTEXT/Dockerfile}"
+          grep '^FROM ' "$dockerfile" > base-images.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -79,6 +79,31 @@ class ReleaseContractsTest(unittest.TestCase):
                             step["env"].pop("DOCKERFILE")
                 self.assertTrue(self.errors(workflow))
 
+    def test_base_evidence_uses_the_selected_or_context_dockerfile(self):
+        recording = next(
+            step for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Record immutable digest and base references"
+        )
+        lines = recording["run"].splitlines()
+        script = "\n".join(line for line in lines if "dockerfile=" in line or line.startswith("grep "))
+        for selected, expected in (("", "FROM default@sha256:default\n"),
+                                    ("custom with space.Dockerfile", "FROM selected@sha256:selected\n")):
+            with self.subTest(selected=selected):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "nested").mkdir()
+                    (root / "nested" / "Dockerfile").write_text("FROM default@sha256:default\n")
+                    (root / "custom with space.Dockerfile").write_text("FROM selected@sha256:selected\n")
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", script], cwd=root,
+                        env=dict(os.environ, BUILD_CONTEXT="nested", DOCKERFILE=selected),
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual((root / "base-images.txt").read_text(), expected)
+        recording["env"].pop("DOCKERFILE")
+        self.assertTrue(self.errors(self.workflow))
+
     def test_existing_entrypoint_is_the_compatible_default(self):
         self.workflow["on"]["workflow_call"]["inputs"]["hardened_entrypoint"]["default"] = '["./other"]'
         self.assertTrue(self.errors(self.workflow))

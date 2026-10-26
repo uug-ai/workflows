@@ -294,6 +294,11 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
                 errors.append(f"release-create.yml: {name} must use the tested Dockerfile")
             if re.search(r"github_(?:username|token)", options.get("build-args", "")):
                 errors.append(f"release-create.yml: {name} must not use credential build arguments")
+        if name == "Record immutable digest and base references" and (
+            step.get("env", {}).get("DOCKERFILE") != "${{ inputs.hardened_dockerfile }}"
+            or '${DOCKERFILE:-$BUILD_CONTEXT/Dockerfile}' not in step.get("run", "")
+        ):
+            errors.append("release-create.yml: base evidence must use the published Dockerfile")
         if name == "Publish staged image with provenance and SBOM":
             if step["with"].get("provenance") != "mode=max" or step["with"].get("sbom") is not True:
                 errors.append("release-create.yml: publishing requires provenance and SBOM")
