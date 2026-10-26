@@ -42,6 +42,10 @@ on:
         required: false
         type: boolean
         default: true
+      use_buildkit_secrets:
+        description: 'Pass private module credentials as github_token BuildKit secret instead of credential build arguments'
+        type: boolean
+        default: false
       registry_login:
         description: 'Log in to GHCR before building the image'
         required: false
@@ -126,9 +130,14 @@ jobs:
           password: ${{ secrets.TOKEN }}
       - name: Run Build
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
           build_args=(--build-arg "project=${{ env.PROJECT }}")
-          if [[ "${{ inputs.use_private_module_auth }}" == "true" ]]; then
+          if [[ "${{ inputs.use_buildkit_secrets }}" == "true" ]]; then
+            test -n "$GH_TOKEN" || { echo "::error::TOKEN is required for BuildKit module authentication"; exit 1; }
+            build_args+=(--secret id=github_token,env=GH_TOKEN)
+          elif [[ "${{ inputs.use_private_module_auth }}" == "true" ]]; then
             build_args+=(
               --build-arg "github_username=${{ secrets.USERNAME }}"
               --build-arg "github_token=${{ secrets.TOKEN }}"

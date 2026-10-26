@@ -269,6 +269,30 @@ filesystem mode and emits a browser SPDX report. An OS/library image scan alone
 does not detect standalone npm lockfiles. Both reports must satisfy the same
 medium/high/critical policy; missing browser scan output must fail the gate.
 
+### Hardened API releases
+
+Set `hardened: true`, `hardened_profile: api` and
+`use_private_module_auth: true` for Hub API. Supply `secrets.TOKEN` with read
+access to its private Go dependencies. Native test, inspection and publication
+builds pass it only as the BuildKit secret `github_token`, never a credential
+build argument. The API Dockerfile requires that secret, scopes Git credential
+lookup to GitHub and must not persist a token-bearing Git configuration.
+Worker/frontend callers retain their existing no-authentication requirements.
+
+The API profile starts MongoDB and RabbitMQ, retains the common `/app/main`,
+numeric non-root identity, scans/SBOM/provenance/signing/promotion contracts,
+and checks `CMD ["serve"]`, `/home/hub-api`, and the unchanged public key.
+Its repository-provided `image/smoke-test.sh hardened:scan` must verify port8081
+HTTP, database warmup, audit queue declaration, rejected unauthenticated access
+and unchanged unlicensed health behavior under read-only/no-capability
+constraints with writable `/tmp`. `smoke_queue` remains worker-only.
+
+The reusable PR build and preview workflows additionally expose
+`use_buildkit_secrets: true` for this Dockerfile. That opt-in replaces credential
+build arguments with the same secret; defaults preserve existing callers.
+Previews must still be explicitly gated by the consuming repository until its
+runtime manifests support the hardened identity and temporary storage.
+
 ## Release bump example
 
 `release-bump.yml` determines the next semantic version from the latest `v*` tag, creates a GitHub release with generated notes, and exposes the new tag as the `tag` output. Its `draft` input defaults to `false` for existing callers; hardened callers should use `draft: true` and chain `release-create.yml` with `finalize_release: true`. A release created with the default `GITHUB_TOKEN` does not emit a `release: created` event, so chain the workflows directly.

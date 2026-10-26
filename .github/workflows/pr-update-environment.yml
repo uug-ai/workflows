@@ -37,6 +37,10 @@ on:
         required: false
         type: string
         default: '.'
+      use_buildkit_secrets:
+        description: 'Pass private module credentials as github_token BuildKit secret instead of credential build arguments'
+        type: boolean
+        default: false
       gitops_repo:
         description: 'GitOps repository in owner/name format'
         required: false
@@ -100,11 +104,17 @@ jobs:
           username: ${{ secrets.USERNAME }}
           password: ${{ secrets.TOKEN }}
       - name: Run Build
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
-          docker build -t "${{ env.PROJECT }}" \
-          --build-arg "project=${{ env.PROJECT }}" \
-          --build-arg "github_username=${{ secrets.USERNAME }}" \
-          --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.BUILD_CONTEXT }}"
+          args=(--build-arg "project=${{ env.PROJECT }}")
+          if [ "${{ inputs.use_buildkit_secrets }}" = true ]; then
+            test -n "$GH_TOKEN" || { echo "::error::TOKEN is required for BuildKit module authentication"; exit 1; }
+            args+=(--secret id=github_token,env=GH_TOKEN)
+          else
+            args+=(--build-arg "github_username=${{ secrets.USERNAME }}" --build-arg "github_token=${{ secrets.TOKEN }}")
+          fi
+          docker build -t "${{ env.PROJECT }}" "${args[@]}" "${{ env.BUILD_CONTEXT }}"
 
       - name: Build and push Docker image
         run: |

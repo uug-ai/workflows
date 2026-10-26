@@ -55,6 +55,93 @@ class ReleaseContractsTest(unittest.TestCase):
                         break
                 self.assertTrue(self.errors(workflow))
 
+    def test_api_smoke_test_cannot_be_missing_or_unconditional(self):
+        for condition in (None, "always()"):
+            with self.subTest(condition=condition):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow["jobs"]["hardened-images"]["steps"]
+                for step in steps:
+                    if step.get("name") == "Smoke test API HTTP and database readiness":
+                        if condition is None:
+                            steps.remove(step)
+                        else:
+                            step["if"] = condition
+                        break
+                self.assertTrue(self.errors(workflow))
+
+    def test_api_dependencies_cannot_be_skipped(self):
+        for name in ("mongodb", "rabbitmq"):
+            with self.subTest(service=name):
+                workflow = copy.deepcopy(self.workflow)
+                workflow["jobs"]["hardened-images"]["services"][name]["image"] = ""
+                self.assertTrue(self.errors(workflow))
+
+    def test_module_secrets_are_required_in_every_native_build_surface(self):
+        for name in ("Run native tests and vulnerability reachability checks",
+                     "Build final image for inspection", "Publish staged image with provenance and SBOM"):
+            with self.subTest(step=name):
+                workflow = copy.deepcopy(self.workflow)
+                for step in workflow["jobs"]["hardened-images"]["steps"]:
+                    if step.get("name") == name:
+                        if "run" in step:
+                            step["env"] = {}
+                        else:
+                            del step["with"]["secrets"]
+                self.assertTrue(self.errors(workflow))
+
+    def test_native_builds_cannot_reintroduce_credential_build_arguments(self):
+        for name in ("Build final image for inspection", "Publish staged image with provenance and SBOM"):
+            with self.subTest(step=name):
+                workflow = copy.deepcopy(self.workflow)
+                for step in workflow["jobs"]["hardened-images"]["steps"]:
+                    if step.get("name") == name:
+                        step["with"]["build-args"] += "\ngithub_token=unsafe"
+                self.assertTrue(self.errors(workflow))
+
+    def test_pr_buildkit_mode_uses_secret_ids_not_token_arguments(self):
+        for name in ("pr-build.yml", "pr-update-environment.yml"):
+            workflow = load_yaml(WORKFLOWS_DIR / name)
+            self.assertFalse(workflow["on"]["workflow_call"]["inputs"]["use_buildkit_secrets"]["default"])
+            build = next(step for job in workflow["jobs"].values() for step in job.get("steps", [])
+                         if step.get("name") == "Run Build")
+            script = build["run"]
+            replacements = {
+                "${{ inputs.use_buildkit_secrets }}": "true",
+                "${{ inputs.use_private_module_auth }}": "true",
+                "${{ secrets.USERNAME }}": "ci",
+                "${{ secrets.TOKEN }}": "private-build-token",
+                "${{ env.PROJECT }}": "example",
+                "${{ env.BUILD_CONTEXT }}": ".",
+                "${{ matrix.architecture }}": "amd64",
+            }
+            for old, new in replacements.items():
+                script = script.replace(old, new)
+            for token in ("private-build-token", ""):
+                with self.subTest(workflow=name, supplied=bool(token)):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        docker = root / "docker"
+                        docker.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$BUILD_ARGS"\n')
+                        docker.chmod(0o755)
+                        arguments = root / "arguments"
+                        result = subprocess.run(
+                            ["bash", "-e", "-c", script], cwd=root,
+                            env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
+                                     GH_TOKEN=token, BUILD_ARGS=str(arguments)),
+                            capture_output=True, text=True,
+                        )
+                        if token:
+                            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                            values = arguments.read_text()
+                            self.assertIn("--secret\ngithub_token,env=GH_TOKEN", values.replace("id=", ""))
+                            self.assertNotIn(token, values)
+                            self.assertNotIn("github_username=", values)
+                            self.assertNotIn("github_token=", values)
+                        else:
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn("::error::TOKEN is required", result.stdout)
+                            self.assertFalse(arguments.exists())
+
     def test_each_hardened_gate_is_required(self):
         steps = self.workflow["jobs"]["hardened-images"]["steps"]
         required = (
@@ -423,17 +510,20 @@ esac
             step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
             if step.get("name") == "Validate hardened release configuration"
         )
-        for profile, queue, expected in (
-            ("worker", "queue", 0),
-            ("worker", "", 1),
-            ("frontend", "", 0),
-            ("unknown", "queue", 1),
+        for profile, queue, auth, expected in (
+            ("worker", "queue", "false", 0),
+            ("worker", "", "false", 1),
+            ("frontend", "", "false", 0),
+            ("api", "", "true", 0),
+            ("worker", "queue", "true", 1),
+            ("frontend", "", "true", 1),
+            ("unknown", "queue", "false", 1),
         ):
             with self.subTest(profile=profile, queue=queue):
                 result = subprocess.run(
                     ["bash", "-e", "-c", script],
                     env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE=queue,
-                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG=""),
+                             PRIVATE_MODULE_AUTH=auth, PUBLISH="false", RELEASE_TAG=""),
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
