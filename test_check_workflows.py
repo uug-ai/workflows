@@ -1,10 +1,17 @@
 import copy
+import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 
-from check_workflows import WORKFLOWS_DIR, load_yaml, validate_release_workflow
+from check_workflows import (
+    WORKFLOWS_DIR,
+    load_yaml,
+    validate_release_bump_workflow,
+    validate_release_workflow,
+)
 
 
 class ReleaseContractsTest(unittest.TestCase):
@@ -20,7 +27,7 @@ class ReleaseContractsTest(unittest.TestCase):
         self.assertEqual(self.errors(self.workflow), [])
 
     def test_legacy_defaults_cannot_enable_hardening_or_disable_publication(self):
-        for key, value in (("hardened", True), ("publish", False)):
+        for key, value in (("hardened", True), ("publish", False), ("finalize_release", True)):
             with self.subTest(key=key):
                 workflow = copy.deepcopy(self.workflow)
                 workflow["on"]["workflow_call"]["inputs"][key]["default"] = value
@@ -51,7 +58,7 @@ class ReleaseContractsTest(unittest.TestCase):
             with self.subTest(key=key):
                 workflow = copy.deepcopy(self.workflow)
                 for step in workflow["jobs"]["hardened-images"]["steps"]:
-                    if step.get("name") == "Publish verified image with provenance and SBOM":
+                    if step.get("name") == "Publish staged image with provenance and SBOM":
                         step["with"][key] = value
                 self.assertTrue(self.errors(workflow))
 
@@ -61,7 +68,7 @@ class ReleaseContractsTest(unittest.TestCase):
 
     def test_native_images_and_registry_scans_use_platform_package(self):
         for name, key in (
-            ("Publish verified image with provenance and SBOM", "tags"),
+            ("Publish staged image with provenance and SBOM", "tags"),
             ("Scan immutable published image", "image-ref"),
         ):
             with self.subTest(name=name):
@@ -102,6 +109,263 @@ class ReleaseContractsTest(unittest.TestCase):
     def test_promotion_must_wait_for_verified_manifest(self):
         self.workflow["jobs"]["update-gitops"]["needs"] = ["build"]
         self.assertTrue(self.errors(self.workflow))
+
+    def test_native_version_tags_cannot_be_published_before_registry_gates(self):
+        for step in self.workflow["jobs"]["hardened-images"]["steps"]:
+            if step.get("id") == "publish":
+                step["with"]["tags"] = (
+                    "ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform:"
+                    "${{ matrix.architecture }}-${{ env.TAG }}"
+                )
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_manifest_verification_must_precede_promotion_and_finalization(self):
+        steps = self.workflow["jobs"]["hardened-manifest"]["steps"]
+        for name in (
+            "Assemble and verify staged multi-platform manifest",
+            "Promote verified image tags",
+            "Finalize verified GitHub release",
+        ):
+            with self.subTest(name=name):
+                workflow = copy.deepcopy(self.workflow)
+                workflow["jobs"]["hardened-manifest"]["steps"] = [
+                    step for step in steps if step.get("name") != name
+                ]
+                self.assertTrue(self.errors(workflow))
+        promotion = next(step for step in steps if step.get("name") == "Promote verified image tags")
+        steps.remove(promotion)
+        steps.insert(0, promotion)
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_unsigned_manifest_cannot_use_a_version_tag(self):
+        for step in self.workflow["jobs"]["hardened-manifest"]["steps"]:
+            if step.get("name") == "Assemble and verify staged multi-platform manifest":
+                step["run"] = step["run"].replace(
+                    'staging="$IMAGE:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+                    'staging="$IMAGE:$TAG"',
+                )
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_release_finalization_cannot_precede_evidence_upload(self):
+        steps = self.workflow["jobs"]["hardened-manifest"]["steps"]
+        finalization = steps.pop()
+        steps.insert(0, finalization)
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_release_finalization_cannot_be_unconditional(self):
+        self.workflow["jobs"]["hardened-manifest"]["steps"][-1]["if"] = "always()"
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_bump_preserves_legacy_default(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-bump.yml")
+        errors = []
+        validate_release_bump_workflow(workflow, errors)
+        self.assertEqual(errors, [])
+        workflow["on"]["workflow_call"]["inputs"]["draft"]["default"] = True
+        validate_release_bump_workflow(workflow, errors)
+        self.assertTrue(errors)
+
+
+class ReleaseExecutionTest(unittest.TestCase):
+    COMMAND_STUB = """#!/bin/bash
+set -euo pipefail
+tool=${0##*/}
+printf '%s' "$tool" >> "$EVENT_LOG"
+printf ' %s' "$@" >> "$EVENT_LOG"
+printf '\\n' >> "$EVENT_LOG"
+case "$tool" in
+  docker)
+    if [ "$3" = create ]; then
+      target=$5
+      case "$target" in
+        *:staging-*) point=stage ;;
+        *-platform:*) point=native ;;
+        *:latest) point=latest ;;
+        *) point=version ;;
+      esac
+      if [ "$FAIL_AT" = "$point" ]; then exit 1; fi
+      source=${@: -1}
+      digest=${source##*@}
+      if [ "$point" = stage ]; then digest=sha256:verified; fi
+      if [ "$FAIL_AT" = mismatch ] && [ "$point" = version ]; then digest=sha256:wrong; fi
+      printf '%s\\n' "$digest" > "$STATE_DIR/${target##*:}"
+    elif [ "$5" = --raw ]; then
+      printf '{"schemaVersion":2}\\n'
+    else
+      if [ "$FAIL_AT" = stage-inspect ] && [[ "$4" == *:staging-* ]]; then exit 1; fi
+      cat "$STATE_DIR/${4##*:}"
+    fi
+    ;;
+  cosign)
+    if [ "$FAIL_AT" = "$1" ]; then exit 1; fi
+    printf '[]\\n'
+    ;;
+  gh)
+    if [ "$2" = view ]; then
+      if [ "$FAIL_AT" = release-view ]; then exit 1; fi
+      printf '%s\\n' "$DRAFT_STATE"
+    elif [ "$2" = edit ] && [ "$FAIL_AT" = release-edit ]; then
+      exit 1
+    fi
+    ;;
+  git)
+    if [ "$FAIL_AT" = "$1" ]; then exit 1; fi
+    ;;
+esac
+"""
+
+    def setUp(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        self.steps = workflow["jobs"]["hardened-manifest"]["steps"]
+        self.registry_gate = next(
+            step["run"] for step in workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Gate immutable published image"
+        )
+        bump = load_yaml(WORKFLOWS_DIR / "release-bump.yml")
+        self.bump_script = bump["jobs"]["bump-release"]["steps"][-1]["run"]
+
+    def execute(self, scripts, fail_at="", draft_state="true", draft="true", report=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for command in ("docker", "cosign", "gh", "git"):
+                executable = root / command
+                executable.write_text(self.COMMAND_STUB)
+                executable.chmod(0o755)
+            for arch in ("amd64", "arm64"):
+                (root / f"digest-{arch}.txt").write_text(f"sha256:{arch}\n")
+            if report is not None:
+                (root / "published-image-security.json").write_text(json.dumps(report))
+            env = dict(
+                os.environ,
+                PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
+                EVENT_LOG=str(root / "events"),
+                STATE_DIR=str(root),
+                FAIL_AT=fail_at,
+                DRAFT_STATE=draft_state,
+                DRAFT=draft,
+                IMAGE="ghcr.io/uug-ai/example",
+                PLATFORM_IMAGE="ghcr.io/uug-ai/example-platform",
+                TAG="v1.2.3",
+                GITHUB_SHA="source-commit",
+                GITHUB_REPOSITORY="uug-ai/example",
+                GITHUB_RUN_ID="42",
+                GITHUB_RUN_ATTEMPT="2",
+                GITHUB_STEP_SUMMARY=str(root / "summary"),
+            )
+            result = subprocess.run(
+                ["bash", "-e", "-c", "\n".join(scripts)],
+                cwd=root, env=env, capture_output=True, text=True,
+            )
+            event_log = root / "events"
+            events = event_log.read_text().splitlines() if event_log.exists() else []
+            return result, events, (root / "verified-digest.txt").exists()
+
+    def manifest_scripts(self):
+        return [step["run"] for step in self.steps if "run" in step]
+
+    def test_final_tags_and_github_publication_follow_verification(self):
+        result, events, verified = self.execute(self.manifest_scripts())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(verified)
+        verify_index = next(i for i, event in enumerate(events) if event.startswith("cosign verify "))
+        staging = [event for event in events[:verify_index] if event.startswith("docker buildx imagetools create")]
+        self.assertEqual(len(staging), 1)
+        self.assertIn("example:staging-42-2 ", staging[0])
+        for target in (
+            "example-platform:amd64-v1.2.3",
+            "example-platform:arm64-v1.2.3",
+            "example:v1.2.3",
+            "example:latest",
+        ):
+            index = next(i for i, event in enumerate(events) if event.startswith(
+                f"docker buildx imagetools create -t ghcr.io/uug-ai/{target} "
+            ))
+            self.assertGreater(index, verify_index)
+        self.assertEqual(events[-1], "gh release edit v1.2.3 --repo uug-ai/example --draft=false --verify-tag")
+
+    def test_staging_or_signing_failure_does_not_expose_final_tags(self):
+        for point in ("stage", "stage-inspect", "sign", "verify"):
+            with self.subTest(point=point):
+                result, events, verified = self.execute(self.manifest_scripts(), fail_at=point)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(verified)
+                self.assertFalse(any("example:v1.2.3" in event or "example:latest" in event for event in events))
+                self.assertFalse(any(event.startswith("gh release ") for event in events))
+
+    def test_registry_policy_failure_prevents_all_finalization(self):
+        for kind in ("Vulnerabilities", "Secrets"):
+            for severity in ("MEDIUM", "HIGH", "CRITICAL"):
+                with self.subTest(kind=kind, severity=severity):
+                    report = {"Results": [{kind: [{"Severity": severity}]}]}
+                    result, events, verified = self.execute(
+                        [self.registry_gate, *self.manifest_scripts()], report=report,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(events, [])
+                    self.assertFalse(verified)
+
+    def test_nonblocking_inventory_findings_preserve_existing_policy(self):
+        for severity in ("UNKNOWN", "LOW"):
+            with self.subTest(severity=severity):
+                report = {"Results": [{"Vulnerabilities": [{"Severity": severity}]}]}
+                result, events, verified = self.execute(
+                    [self.registry_gate, *self.manifest_scripts()], report=report,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(verified)
+                self.assertTrue(events[-1].startswith("gh release edit "))
+
+    def test_promotion_failure_or_digest_mismatch_keeps_release_draft(self):
+        for point in ("native", "version", "latest", "mismatch"):
+            with self.subTest(point=point):
+                result, events, verified = self.execute(self.manifest_scripts(), fail_at=point)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(verified)
+                self.assertFalse(any(event.startswith("gh release ") for event in events))
+                if point == "mismatch":
+                    self.assertIn("::error::Promoted digest", result.stdout)
+
+    def test_github_errors_are_not_reported_as_success(self):
+        for point in ("release-view", "release-edit"):
+            with self.subTest(point=point):
+                result, _, _ = self.execute(self.manifest_scripts(), fail_at=point)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_already_published_release_is_not_modified(self):
+        result, events, _ = self.execute(self.manifest_scripts(), draft_state="false")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(event.startswith("gh release edit ") for event in events))
+        self.assertIn("already published", result.stdout)
+
+    def test_invalid_release_state_is_an_explicit_error(self):
+        result, events, _ = self.execute(self.manifest_scripts(), draft_state="null")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("::error::Unexpected draft state", result.stdout)
+        self.assertFalse(any(event.startswith("gh release edit ") for event in events))
+
+    def test_draft_bump_reserves_source_tag_before_creating_draft(self):
+        result, events, _ = self.execute([self.bump_script])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(events[:2], [
+            "git tag v1.2.3 source-commit",
+            "git push origin refs/tags/v1.2.3",
+        ])
+        self.assertIn("--draft --verify-tag", events[2])
+
+    def test_source_tag_failure_prevents_draft_creation(self):
+        for point in ("tag", "push"):
+            with self.subTest(point=point):
+                result, events, _ = self.execute([self.bump_script], fail_at=point)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any(event.startswith("gh release create ") for event in events))
+
+    def test_legacy_bump_does_not_reserve_or_draft(self):
+        result, events, _ = self.execute([self.bump_script], draft="false")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].startswith("gh release create v1.2.3 "))
+        self.assertNotIn("--draft", events[0])
+        self.assertNotIn("--verify-tag", events[0])
 
 
 if __name__ == "__main__":

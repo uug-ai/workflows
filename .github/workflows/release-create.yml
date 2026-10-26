@@ -30,6 +30,10 @@ on:
         description: 'Publish verified images; false runs hardened validation only'
         type: boolean
         default: true
+      finalize_release:
+        description: 'Publish an existing draft GitHub release after hardened image promotion succeeds'
+        type: boolean
+        default: false
       smoke_queue:
         description: 'RabbitMQ consumer queue required by the hardened MongoDB/RabbitMQ worker smoke test'
         type: string
@@ -354,14 +358,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Publish verified image with provenance and SBOM
+      - name: Publish staged image with provenance and SBOM
         if: inputs.publish
         id: publish
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.docker_context }}
           push: true
-          tags: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform:${{ matrix.architecture }}-${{ env.TAG }}
+          tags: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform:staging-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}
           provenance: mode=max
           sbom: true
           build-args: |
@@ -423,26 +427,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - uses: sigstore/cosign-installer@v3
-      - name: Publish and sign immutable multi-platform manifest
+      - name: Assemble and verify staged multi-platform manifest
         env:
           IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}
           PLATFORM_IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform
         run: |
+          set -euo pipefail
           image_refs=()
           for file in digest-*.txt; do
             test -f "$file"
             image_refs+=("$PLATFORM_IMAGE@$(cat "$file")")
           done
-          docker buildx imagetools create -t "$IMAGE:$TAG" "${image_refs[@]}"
-          docker buildx imagetools inspect "$IMAGE:$TAG" --raw > manifest.json
-          digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          staging="$IMAGE:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker buildx imagetools create -t "$staging" "${image_refs[@]}"
+          docker buildx imagetools inspect "$staging" --raw > manifest.json
+          digest=$(docker buildx imagetools inspect "$staging" --format '{{json .Manifest.Digest}}' | tr -d '"')
           cosign sign --yes "$IMAGE@$digest"
           cosign verify \
             --certificate-identity-regexp '^https://github.com/uug-ai/workflows/.github/workflows/release-create.yml@refs/.*$' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$IMAGE@$digest" > signature-verification.json
-          docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE@$digest"
+          printf '%s\n' "$digest" > verified-digest.txt
           echo "$IMAGE@$digest" | tee image-digest.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Promote verified image tags
+        env:
+          IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}
+          PLATFORM_IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform
+        run: |
+          set -euo pipefail
+          promote() {
+            local target="$1" repository="$2" expected="$3" actual
+            docker buildx imagetools create -t "$target" "$repository@$expected"
+            actual=$(docker buildx imagetools inspect "$target" --format '{{json .Manifest.Digest}}' | tr -d '"')
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::Promoted digest for $target does not match verified digest $expected"
+              exit 1
+            fi
+          }
+
+          digest=$(cat verified-digest.txt)
+          for file in digest-*.txt; do
+            test -f "$file"
+            architecture=${file#digest-}
+            architecture=${architecture%.txt}
+            promote "$PLATFORM_IMAGE:$architecture-$TAG" "$PLATFORM_IMAGE" "$(cat "$file")"
+          done
+          promote "$IMAGE:$TAG" "$IMAGE" "$digest"
+          promote "$IMAGE:latest" "$IMAGE" "$digest"
       - uses: actions/upload-artifact@v4
         with:
           name: hardened-release
@@ -450,6 +481,25 @@ jobs:
             manifest.json
             image-digest.txt
             signature-verification.json
+      - name: Finalize verified GitHub release
+        if: inputs.finalize_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          case "$draft" in
+            true)
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --verify-tag
+              ;;
+            false)
+              echo "Release $TAG is already published; preserving its publication state."
+              ;;
+            *)
+              echo "::error::Unexpected draft state for release $TAG: $draft"
+              exit 1
+              ;;
+          esac
 
   update-gitops:
     permissions:
