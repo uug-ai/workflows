@@ -46,7 +46,8 @@ class ReleaseContractsTest(unittest.TestCase):
                             ("hardened_workdir", "/home/other"),
                             ("browser_inventory", True),
                             ("hardened_dockerfile", "Dockerfile.cv"),
-                            ("worker_additional_smoke", True)):
+                            ("worker_additional_smoke", True),
+                            ("smoke_predeclare_quorum", True)):
             with self.subTest(name=name):
                 workflow = copy.deepcopy(self.workflow)
                 workflow["on"]["workflow_call"]["inputs"][name]["default"] = value
@@ -113,6 +114,47 @@ class ReleaseContractsTest(unittest.TestCase):
             if step.get("name") == "Smoke test with a read-only filesystem and no capabilities":
                 step["run"] = step["run"].replace("-e QUEUE_SYSTEM=RABBITMQ", "")
         self.assertTrue(self.errors(self.workflow))
+
+    def test_quorum_fixture_cannot_be_missing_or_unconditional(self):
+        for condition in (None, "always()"):
+            with self.subTest(condition=condition):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow["jobs"]["hardened-images"]["steps"]
+                fixture = next(step for step in steps if step.get("name") == "Prepare legacy worker quorum queue")
+                if condition is None:
+                    steps.remove(fixture)
+                else:
+                    fixture["if"] = condition
+                self.assertTrue(self.errors(workflow))
+
+    def test_quorum_fixture_option_must_reach_source_validation(self):
+        configuration = next(
+            step for step in self.workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        configuration["env"].pop("PREDECLARE_QUORUM")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_quorum_fixture_encodes_queue_names_and_propagates_http_errors(self):
+        script = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Prepare legacy worker quorum queue"
+        )
+        for status in (0, 22):
+            with self.subTest(status=status):
+                result = subprocess.run(
+                    ["bash", "-e", "-c",
+                     'curl() { printf "%s\\n" "$@"; return "$CURL_STATUS"; }\n' + script],
+                    env=dict(os.environ, CI_PASSWORD="fixture-password", CURL_STATUS=str(status),
+                             SMOKE_QUEUE="queue/with space?"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertIn("http://localhost:15672/api/queues/%2F/queue%2Fwith%20space%3F", result.stdout)
+                self.assertIn('{"durable":true,"arguments":{"x-queue-type":"quorum"}}', result.stdout)
+                self.assertIn("-fsS", result.stdout)
+                self.assertIn("--retry-connrefused", result.stdout)
+                self.assertIn("ci:fixture-password", result.stdout)
 
     def test_entrypoint_inspection_cannot_ignore_the_declared_contract(self):
         for step in self.workflow["jobs"]["hardened-images"]["steps"]:
@@ -679,6 +721,27 @@ esac
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 if expected:
                     self.assertIn("worker_additional_smoke", result.stdout)
+
+    def test_quorum_predeclaration_is_rejected_for_nonworker_profiles(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for profile in ("worker", "frontend", "api", "standalone", "mongo-task"):
+            with self.subTest(profile=profile):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE="queue",
+                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="",
+                             ADDITIONAL_SMOKE="false", PREDECLARE_QUORUM="true"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0 if profile == "worker" else 1,
+                                 result.stdout + result.stderr)
+                if profile != "worker":
+                    self.assertIn("smoke_predeclare_quorum", result.stdout)
 
     def test_cmd_only_images_preserve_both_parts_of_the_contract(self):
         workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")

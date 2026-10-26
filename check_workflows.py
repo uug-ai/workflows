@@ -149,6 +149,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: existing callers must retain their context Dockerfile")
     if inputs.get("worker_additional_smoke", {}).get("default") is not False:
         errors.append("release-create.yml: additional worker smoke must remain opt-in")
+    if inputs.get("smoke_predeclare_quorum", {}).get("default") is not False:
+        errors.append("release-create.yml: worker queue provisioning must remain opt-in")
     if "id-token" in data.get("permissions", {}):
         errors.append("release-create.yml: legacy callers must not require OIDC")
 
@@ -158,6 +160,13 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
             errors.append(f"release-create.yml: {job_id} must isolate legacy builds")
     if jobs["hardened-source"]["if"] != "inputs.hardened":
         errors.append("release-create.yml: source gates must be opt-in")
+    configuration = next(
+        (step for step in jobs["hardened-source"]["steps"]
+         if step.get("name") == "Validate hardened release configuration"),
+        {},
+    )
+    if configuration.get("env", {}).get("PREDECLARE_QUORUM") != "${{ inputs.smoke_predeclare_quorum }}":
+        errors.append("release-create.yml: source validation must receive the queue fixture option")
     images = jobs["hardened-images"]
     if images["needs"] != "hardened-source":
         errors.append("release-create.yml: images must require source gates")
@@ -182,6 +191,19 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         (step for step in steps if step.get("name") == "Smoke test with a read-only filesystem and no capabilities"),
         {},
     )
+    queue_fixture = next(
+        (step for step in steps if step.get("name") == "Prepare legacy worker quorum queue"),
+        {},
+    )
+    if (
+        queue_fixture.get("if") != "inputs.hardened_profile == 'worker' && inputs.smoke_predeclare_quorum"
+        or queue_fixture.get("env", {}).get("SMOKE_QUEUE") != "${{ inputs.smoke_queue }}"
+        or queue_fixture.get("env", {}).get("CI_PASSWORD") != images["services"]["rabbitmq"]["env"]["RABBITMQ_DEFAULT_PASS"]
+        or "15672:15672" not in images["services"]["rabbitmq"].get("ports", [])
+        or "'$queue | @uri'" not in queue_fixture.get("run", "")
+        or '"x-queue-type":"quorum"' not in queue_fixture.get("run", "")
+    ):
+        errors.append("release-create.yml: legacy queue fixtures must be explicit, encoded quorum declarations")
     frontend_smoke = next(
         (step for step in steps if step.get("name") == "Smoke test frontend routing and runtime configuration"),
         {},
@@ -220,10 +242,10 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         profiles = "inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api'"
         if service == "mongodb":
             profiles += " || inputs.hardened_profile == 'mongo-task'"
-        expected = (
-            "${{ (" + profiles + ") "
-            f"&& '{image}' || '' }}}}"
-        )
+        selected_image = f"'{image}'"
+        if service == "rabbitmq":
+            selected_image = "(inputs.smoke_predeclare_quorum && 'rabbitmq:4-management-alpine' || 'rabbitmq:4-alpine')"
+        expected = "${{ (" + profiles + ") && " + selected_image + " || '' }}"
         if images["services"][service]["image"] != expected:
             errors.append(f"release-create.yml: {service} must match the profile dependencies")
     native_tests = next(
@@ -267,6 +289,7 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     required_order = [
         "Run native tests and vulnerability reachability checks",
         "Inspect image contract",
+        "Prepare legacy worker quorum queue",
         "Smoke test with a read-only filesystem and no capabilities",
         "Smoke test frontend routing and runtime configuration",
         "Smoke test API HTTP and database readiness",

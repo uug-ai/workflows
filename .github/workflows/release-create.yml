@@ -54,6 +54,10 @@ on:
         description: 'Require image/smoke-test.sh in addition to worker queue readiness'
         type: boolean
         default: false
+      smoke_predeclare_quorum:
+        description: 'Provision a durable quorum queue for workers that require an existing queue'
+        type: boolean
+        default: false
       publish:
         description: 'Publish verified images; false runs hardened validation only'
         type: boolean
@@ -236,6 +240,7 @@ jobs:
           EXPECTED_WORKDIR: ${{ inputs.hardened_workdir }}
           MODULE_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
           ADDITIONAL_SMOKE: ${{ inputs.worker_additional_smoke }}
+          PREDECLARE_QUORUM: ${{ inputs.smoke_predeclare_quorum }}
         run: |
           if ! jq -es 'length == 1 and (.[0] | . == null or (type == "array" and all(.[]; type == "string" and length > 0)))' \
             <<< "$EXPECTED_ENTRYPOINT" > /dev/null; then
@@ -266,6 +271,10 @@ jobs:
           esac
           if [ "$ADDITIONAL_SMOKE" = true ] && [ "$PROFILE" != worker ]; then
             echo "::error::worker_additional_smoke is only supported for worker images"
+            exit 1
+          fi
+          if [ "$PREDECLARE_QUORUM" = true ] && [ "$PROFILE" != worker ]; then
+            echo "::error::smoke_predeclare_quorum is only supported for worker images"
             exit 1
           fi
           if [ "$PROFILE" = worker ] && [ -z "$SMOKE_QUEUE" ]; then
@@ -320,11 +329,11 @@ jobs:
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
           --health-interval 5s --health-timeout 5s --health-retries 20
       rabbitmq:
-        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') && 'rabbitmq:4-alpine' || '' }}
+        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') && (inputs.smoke_predeclare_quorum && 'rabbitmq:4-management-alpine' || 'rabbitmq:4-alpine') || '' }}
         env:
           RABBITMQ_DEFAULT_USER: ci
           RABBITMQ_DEFAULT_PASS: ${{ github.run_id }}-${{ github.run_attempt }}
-        ports: ["5672:5672"]
+        ports: ["5672:5672", "15672:15672"]
         options: >-
           --health-cmd "rabbitmq-diagnostics -q ping"
           --health-interval 5s --health-timeout 5s --health-retries 20
@@ -409,6 +418,17 @@ jobs:
             echo "::error::runtime contains a setuid or setgid executable"
             exit 1
           fi
+      - name: Prepare legacy worker quorum queue
+        if: inputs.hardened_profile == 'worker' && inputs.smoke_predeclare_quorum
+        env:
+          CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          SMOKE_QUEUE: ${{ inputs.smoke_queue }}
+        run: |
+          queue_path="$(jq -rn --arg queue "$SMOKE_QUEUE" '$queue | @uri')"
+          curl -fsS --retry 20 --retry-connrefused --retry-delay 2 --retry-max-time 60 --max-time 5 \
+            --user "ci:$CI_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+            --data-binary '{"durable":true,"arguments":{"x-queue-type":"quorum"}}' \
+            "http://localhost:15672/api/queues/%2F/$queue_path"
       - name: Smoke test with a read-only filesystem and no capabilities
         if: inputs.hardened_profile == 'worker'
         env:

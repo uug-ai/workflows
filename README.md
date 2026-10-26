@@ -291,6 +291,13 @@ repository script **after** the existing queue readiness check. This is not a
 replacement for queue checks: use it to verify the actual image's FFmpeg/OpenCV
 or other native resources with a small local fixture. It is rejected for other
 profiles rather than silently ignored.
+Legacy workers that consume an already-provisioned durable quorum queue can set
+`smoke_predeclare_quorum: true`. Only this opt-in enables the isolated RabbitMQ
+management fixture and declares `smoke_queue` before worker startup. Declaration
+failures block validation; queue names are URL-encoded and readiness still
+requires the actual worker consumer. Existing callers retain their queue
+bootstrap behavior. This option is rejected for non-worker profiles.
+
 Repository smoke receives `RUNTIME_EVIDENCE_DIR=runtime-evidence`; use it for
 native test reports. The workflow retains that directory and `*-smoke.log` files
 alongside the common evidence. Private native-test builds must use the provided
