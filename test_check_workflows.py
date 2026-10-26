@@ -239,10 +239,15 @@ esac
             step["run"] for step in workflow["jobs"]["hardened-images"]["steps"]
             if step.get("name") == "Gate immutable published image"
         )
+        self.image_gate = next(
+            step["run"] for step in workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Enforce vulnerability and secret policy"
+        )
         bump = load_yaml(WORKFLOWS_DIR / "release-bump.yml")
         self.bump_script = bump["jobs"]["bump-release"]["steps"][-1]["run"]
 
-    def execute(self, scripts, fail_at="", draft_state="true", draft="true", report=None):
+    def execute(self, scripts, fail_at="", draft_state="true", draft="true", report=None,
+                profile="worker", browser_report=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for command in ("docker", "cosign", "gh", "git"):
@@ -253,6 +258,9 @@ esac
                 (root / f"digest-{arch}.txt").write_text(f"sha256:{arch}\n")
             if report is not None:
                 (root / "published-image-security.json").write_text(json.dumps(report))
+                (root / "image-security.json").write_text(json.dumps(report))
+            if browser_report is not None:
+                (root / "browser-security.json").write_text(json.dumps(browser_report))
             env = dict(
                 os.environ,
                 PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
@@ -261,6 +269,7 @@ esac
                 FAIL_AT=fail_at,
                 DRAFT_STATE=draft_state,
                 DRAFT=draft,
+                PROFILE=profile,
                 IMAGE="ghcr.io/uug-ai/example",
                 PLATFORM_IMAGE="ghcr.io/uug-ai/example-platform",
                 TAG="v1.2.3",
@@ -321,6 +330,29 @@ esac
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(events, [])
                     self.assertFalse(verified)
+
+    def test_browser_findings_block_even_when_os_image_scan_is_clean(self):
+        for severity in ("MEDIUM", "HIGH", "CRITICAL"):
+            with self.subTest(severity=severity):
+                result, events, _ = self.execute(
+                    [self.image_gate, *self.manifest_scripts()],
+                    profile="frontend", report={"Results": []},
+                    browser_report={"Results": [{"Vulnerabilities": [{"Severity": severity}]}]},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(events, [])
+
+    def test_frontend_cannot_pass_with_a_missing_browser_scan(self):
+        result, events, _ = self.execute(
+            [self.image_gate, *self.manifest_scripts()],
+            profile="frontend", report={"Results": []},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(events, [])
+
+    def test_worker_policy_does_not_require_frontend_inventory(self):
+        result, _, _ = self.execute([self.image_gate], report={"Results": []})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_nonblocking_inventory_findings_preserve_existing_policy(self):
         for severity in ("UNKNOWN", "LOW"):

@@ -296,6 +296,8 @@ jobs:
             REVISION=${{ steps.metadata.outputs.revision }}
             CREATED=${{ steps.metadata.outputs.created }}
       - name: Inspect image contract
+        env:
+          PROFILE: ${{ inputs.hardened_profile }}
         run: |
           docker image inspect hardened:scan > image-inspect.json
           test "$(docker image inspect hardened:scan --format '{{.Config.User}}')" = 65532:65532
@@ -306,6 +308,11 @@ jobs:
           docker rm "$container"
           tar -tf rootfs.tar > rootfs-files.txt
           tar -tvf rootfs.tar > rootfs-permissions.txt
+          if [ "$PROFILE" = frontend ]; then
+            mkdir frontend-inventory
+            tar -xOf rootfs.tar usr/share/frontend/package.json > frontend-inventory/package.json
+            tar -xOf rootfs.tar usr/share/frontend/package-lock.json > frontend-inventory/package-lock.json
+          fi
           if grep -E '(^|/)(s?bin)/(sh|bash|curl|wget|apt|apk|gcc|go)$' rootfs-files.txt; then
             echo "::error::runtime contains a prohibited shell, utility or build tool"
             exit 1
@@ -355,9 +362,20 @@ jobs:
           format: json
           output: image-security.json
           exit-code: "0"
-      - name: Enforce vulnerability and secret policy
-        run: |
-          jq -e '[.Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' image-security.json
+      - name: Scan browser dependency inventory
+        if: inputs.hardened_profile == 'frontend'
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          version: v0.76.1
+          scan-type: fs
+          scan-ref: frontend-inventory
+          scanners: vuln
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: false
+          trivyignores: ""
+          format: json
+          output: browser-security.json
+          exit-code: "0"
       - name: Generate SPDX SBOM
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
@@ -365,6 +383,24 @@ jobs:
           image-ref: hardened:scan
           format: spdx-json
           output: image.spdx.json
+      - name: Generate browser dependency SPDX SBOM
+        if: inputs.hardened_profile == 'frontend'
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          version: v0.76.1
+          scan-type: fs
+          scan-ref: frontend-inventory
+          format: spdx-json
+          output: browser.spdx.json
+      - name: Enforce vulnerability and secret policy
+        env:
+          PROFILE: ${{ inputs.hardened_profile }}
+        run: |
+          reports=(image-security.json)
+          if [ "$PROFILE" = frontend ]; then
+            reports+=(browser-security.json)
+          fi
+          jq -se '[.[].Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' "${reports[@]}"
       - uses: docker/login-action@v3
         if: inputs.publish
         with:
@@ -415,8 +451,11 @@ jobs:
           name: hardened-image-${{ matrix.architecture }}
           path: |
             image-security.json
+            browser-security.json
             published-image-security.json
             image.spdx.json
+            browser.spdx.json
+            frontend-inventory
             image-inspect.json
             rootfs-files.txt
             rootfs-permissions.txt

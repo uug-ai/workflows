@@ -263,6 +263,11 @@ profiles retain the numeric `/app/main` contract, native `test` build stage,
 source/image scans, immutable rescans, SBOM/provenance, staged promotion,
 signing and optional draft finalization. `smoke_queue` is required only for the
 worker profile; both profiles require `use_private_module_auth: false`.
+The frontend exports `/usr/share/frontend/package.json` and `package-lock.json`
+from the inspected image to `frontend-inventory`, then scans it explicitly in
+filesystem mode and emits a browser SPDX report. An OS/library image scan alone
+does not detect standalone npm lockfiles. Both reports must satisfy the same
+medium/high/critical policy; missing browser scan output must fail the gate.
 
 ## Release bump example
 
