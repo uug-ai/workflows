@@ -298,6 +298,13 @@ failures block validation; queue names are URL-encoded and readiness still
 requires the actual worker consumer. Existing callers retain their queue
 bootstrap behavior. This option is rejected for non-worker profiles.
 
+Image inspection also checks that UID/GID 65532 can search the working-directory
+ancestors and CA directories and read the trust bundle (plus the API license
+public key). `COPY --chmod=0444` of a single file can create unsearchable parent
+directories. Prepare a root-owned tree with 0755 directories and 0444 public
+files in the builder, then copy that tree without a recursive chmod. A passing
+host-IP service smoke alone does not establish working DNS or TLS.
+
 Repository smoke receives `RUNTIME_EVIDENCE_DIR=runtime-evidence`; use it for
 native test reports. The workflow retains that directory and `*-smoke.log` files
 alongside the common evidence. Private native-test builds must use the provided

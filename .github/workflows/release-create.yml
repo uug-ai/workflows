@@ -400,6 +400,36 @@ jobs:
           docker rm "$container"
           tar -tf rootfs.tar > rootfs-files.txt
           tar -tvf rootfs.tar > rootfs-permissions.txt
+          python3 - <<'PY'
+          import json
+          import os
+          import posixpath
+          import tarfile
+
+          with open("image-inspect.json") as source:
+              config = json.load(source)[0]["Config"]
+          with tarfile.open("rootfs.tar") as archive:
+              entries = {
+                  posixpath.normpath(member.name).lstrip("/"): member
+                  for member in archive.getmembers()
+              }
+          paths = {"etc", "etc/ssl", "etc/ssl/certs", "etc/ssl/certs/ca-certificates.crt"}
+          directory = posixpath.normpath(config.get("WorkingDir") or "/")
+          while directory not in ("", "/"):
+              paths.add(directory.lstrip("/"))
+              directory = posixpath.dirname(directory)
+          if os.environ["PROFILE"] == "api":
+              paths.update({"home/hub-api/keys", "home/hub-api/keys/public_key.pem"})
+          for path in sorted(paths):
+              member = entries.get(path)
+              if member is None or not (member.isdir() or member.isfile()):
+                  continue
+              shift = 6 if member.uid == 65532 else 3 if member.gid == 65532 else 0
+              permission = (1 if member.isdir() else 4) << shift
+              if not member.mode & permission:
+                  operation = "traverse" if member.isdir() else "read"
+                  raise SystemExit(f"::error::runtime UID65532 cannot {operation} /{path}")
+          PY
           if [ "$BROWSER_INVENTORY" = true ]; then
             mkdir frontend-inventory
             tar -xOf rootfs.tar usr/share/frontend/package.json > frontend-inventory/package.json

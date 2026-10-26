@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tarfile
 import unittest
 
 from check_workflows import (
@@ -208,6 +209,45 @@ class ReleaseContractsTest(unittest.TestCase):
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def test_runtime_directory_and_trust_file_permissions_are_enforced(self):
+        inspection = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Inspect image contract"
+        )
+        script = inspection.split("python3 - <<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        for path, mode, uid, gid, profile, expected in (
+            ("etc", 0o755, 0, 0, "worker", 0),
+            ("etc", 0o444, 0, 0, "worker", 1),
+            ("etc/ssl", 0o444, 0, 0, "worker", 1),
+            ("etc/ssl/certs", 0o444, 0, 0, "worker", 1),
+            ("etc/ssl/certs/ca-certificates.crt", 0o444, 0, 0, "worker", 0),
+            ("etc/ssl/certs/ca-certificates.crt", 0o400, 0, 0, "worker", 1),
+            ("home/service", 0o444, 0, 0, "worker", 1),
+            ("home/service", 0o700, 65532, 0, "worker", 0),
+            ("home/service", 0o750, 0, 65532, "worker", 0),
+            ("home/service", 0o750, 0, 0, "worker", 1),
+            ("home/hub-api/keys", 0o444, 0, 0, "api", 1),
+            ("home/hub-api/keys/public_key.pem", 0o400, 0, 0, "api", 1),
+        ):
+            with self.subTest(path=path, mode=oct(mode), uid=uid, gid=gid):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "image-inspect.json").write_text(json.dumps([
+                        {"Config": {"WorkingDir": "/home/service"}},
+                    ]))
+                    with tarfile.open(root / "rootfs.tar", "w") as archive:
+                        member = tarfile.TarInfo(path)
+                        member.type = tarfile.REGTYPE if path.endswith((".crt", ".pem")) else tarfile.DIRTYPE
+                        member.mode, member.uid, member.gid = mode, uid, gid
+                        archive.addfile(member)
+                    result = subprocess.run(
+                        ["python3", "-c", script], cwd=root,
+                        env=dict(os.environ, PROFILE=profile), capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    if expected:
+                        self.assertIn("::error::runtime UID65532 cannot", result.stderr)
 
     def test_frontend_smoke_test_cannot_be_missing_or_unconditional(self):
         for condition in (None, "always()"):

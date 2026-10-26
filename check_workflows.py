@@ -187,6 +187,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         or '$(jq -c . <<< "$EXPECTED_COMMAND")' not in inspection.get("run", "")
     ):
         errors.append("release-create.yml: inspection must enforce the declared image entrypoint")
+    if "runtime UID65532 cannot" not in inspection.get("run", ""):
+        errors.append("release-create.yml: inspection must verify non-root access to runtime directories and trust files")
     worker_smoke = next(
         (step for step in steps if step.get("name") == "Smoke test with a read-only filesystem and no capabilities"),
         {},
