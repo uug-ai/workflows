@@ -41,6 +41,44 @@ class ReleaseContractsTest(unittest.TestCase):
         self.workflow["on"]["workflow_call"]["inputs"]["hardened_profile"]["default"] = "frontend"
         self.assertTrue(self.errors(self.workflow))
 
+    def test_new_runtime_options_preserve_existing_defaults(self):
+        for name, value in (("hardened_command", '["serve"]'),
+                            ("hardened_workdir", "/home/other"),
+                            ("browser_inventory", True),
+                            ("hardened_dockerfile", "Dockerfile.cv"),
+                            ("worker_additional_smoke", True)):
+            with self.subTest(name=name):
+                workflow = copy.deepcopy(self.workflow)
+                workflow["on"]["workflow_call"]["inputs"][name]["default"] = value
+                self.assertTrue(self.errors(workflow))
+
+    def test_repository_smoke_cannot_be_missing_or_unconditional(self):
+        for condition in (None, "always()"):
+            with self.subTest(condition=condition):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow["jobs"]["hardened-images"]["steps"]
+                for step in steps:
+                    if step.get("name") == "Smoke test repository runtime contract":
+                        if condition is None:
+                            steps.remove(step)
+                        else:
+                            step["if"] = condition
+                        break
+                self.assertTrue(self.errors(workflow))
+
+    def test_selected_dockerfile_is_used_by_every_native_build(self):
+        for name in ("Run native tests and vulnerability reachability checks",
+                     "Build final image for inspection", "Publish staged image with provenance and SBOM"):
+            with self.subTest(name=name):
+                workflow = copy.deepcopy(self.workflow)
+                for step in workflow["jobs"]["hardened-images"]["steps"]:
+                    if step.get("name") == name:
+                        if "uses" in step:
+                            step["with"].pop("file")
+                        else:
+                            step["env"].pop("DOCKERFILE")
+                self.assertTrue(self.errors(workflow))
+
     def test_existing_entrypoint_is_the_compatible_default(self):
         self.workflow["on"]["workflow_call"]["inputs"]["hardened_entrypoint"]["default"] = '["./other"]'
         self.assertTrue(self.errors(self.workflow))
@@ -77,6 +115,29 @@ class ReleaseContractsTest(unittest.TestCase):
                     ["bash", "-e", "-c",
                      'docker() { printf "%s\\n" "$ACTUAL_ENTRYPOINT"; }\n' + assertion],
                     env=dict(os.environ, ACTUAL_ENTRYPOINT=actual, EXPECTED_ENTRYPOINT=expected),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def test_command_and_workdir_inspection_match_actual_metadata(self):
+        inspection = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Inspect image contract"
+        )
+        for field, variable, actual, expected, status in (
+            ("Cmd", "EXPECTED_COMMAND", '["./main"]', '["./main"]', 0),
+            ("Cmd", "EXPECTED_COMMAND", '["./other"]', '["./main"]', 1),
+            ("WorkingDir", "EXPECTED_WORKDIR", "/home/vault", "/home/vault", 0),
+            ("WorkingDir", "EXPECTED_WORKDIR", "/app", "/home/vault", 1),
+        ):
+            with self.subTest(field=field, actual=actual):
+                assertion = next(
+                    line for line in inspection.splitlines() if f".Config.{field}}}" in line
+                )
+                result = subprocess.run(
+                    ["bash", "-e", "-c",
+                     'docker() { printf "%s\\n" "$ACTUAL_METADATA"; }\n' + assertion],
+                    env=dict(os.environ, ACTUAL_METADATA=actual, **{variable: expected}),
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
@@ -374,7 +435,7 @@ esac
         self.bump_script = bump["jobs"]["bump-release"]["steps"][-1]["run"]
 
     def execute(self, scripts, fail_at="", draft_state="true", draft="true", report=None,
-                profile="worker", browser_report=None):
+                profile="worker", browser_report=None, browser_inventory=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for command in ("docker", "cosign", "gh", "git"):
@@ -397,6 +458,7 @@ esac
                 DRAFT_STATE=draft_state,
                 DRAFT=draft,
                 PROFILE=profile,
+                BROWSER_INVENTORY="true" if profile == "frontend" or browser_inventory else "false",
                 IMAGE="ghcr.io/uug-ai/example",
                 PLATFORM_IMAGE="ghcr.io/uug-ai/example-platform",
                 TAG="v1.2.3",
@@ -555,6 +617,8 @@ esac
             ("worker", "", "false", 1),
             ("frontend", "", "false", 0),
             ("api", "", "true", 0),
+            ("standalone", "", "false", 0),
+            ("mongo-task", "", "false", 0),
             ("worker", "queue", "true", 0),
             ("frontend", "", "true", 1),
             ("unknown", "queue", "false", 1),
@@ -564,10 +628,58 @@ esac
                     ["bash", "-e", "-c", script],
                     env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE=queue,
                              PRIVATE_MODULE_AUTH=auth, PUBLISH="false", RELEASE_TAG="",
-                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="fixture-token"),
+                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="fixture-token",
+                             ADDITIONAL_SMOKE="false"),
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_additional_worker_smoke_cannot_be_silently_ignored(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for profile, expected in (("worker", 0), ("frontend", 1),
+                                  ("api", 1), ("standalone", 1), ("mongo-task", 1)):
+            with self.subTest(profile=profile):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE="queue",
+                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="",
+                             ADDITIONAL_SMOKE="true"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("worker_additional_smoke", result.stdout)
+
+    def test_cmd_only_images_preserve_both_parts_of_the_contract(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for entrypoint, command, expected in (
+            ("null", '["./main"]', 0), ("[]", '["./main"]', 0),
+            ("null", "", 1), ("null", "[]", 1), ("[]", "[]", 1),
+            ("null", "null", 1), ("null", '[""]', 1),
+            ("null", " ", 1), ("null", '["./main"] ["./other"]', 1),
+            ('["/app/main"]', "[]", 0),
+        ):
+            with self.subTest(entrypoint=entrypoint, command=command):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, PROFILE="standalone", SMOKE_QUEUE="",
+                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT=entrypoint, EXPECTED_COMMAND=command,
+                             MODULE_TOKEN="", ADDITIONAL_SMOKE="false"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("::error::hardened_", result.stdout)
 
     def test_hardened_entrypoint_configuration_rejects_invalid_shapes(self):
         workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
@@ -580,6 +692,7 @@ esac
             ('[ "./hub-pipeline-counting" ]', 0),
             ('[]', 1), ('null', 1), ('{}', 1), ('"main"', 1),
             ('[""]', 1), ('[false]', 1), ('not-json', 1),
+            ('', 1), (' ', 1), ('["/app/main"] ["./other"]', 1),
         ):
             with self.subTest(entrypoint=entrypoint):
                 result = subprocess.run(
@@ -592,6 +705,19 @@ esac
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 if expected:
                     self.assertIn("::error::hardened_entrypoint", result.stdout)
+
+    def test_non_frontend_browser_inventory_is_required_and_gated(self):
+        for browser_report, expected in (
+            (None, 1), ({"Results": []}, 0),
+            ({"Results": [{"Vulnerabilities": [{"Severity": "MEDIUM"}]}]}, 1),
+        ):
+            with self.subTest(browser_report=browser_report):
+                result, _, _ = self.execute(
+                    [self.image_gate], report={"Results": []}, profile="mongo-task",
+                    browser_report=browser_report, browser_inventory=True,
+                )
+                self.assertEqual(result.returncode == 0, expected == 0,
+                                 result.stdout + result.stderr)
 
     def test_private_module_authentication_requires_a_token(self):
         workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")

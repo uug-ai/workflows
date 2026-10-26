@@ -27,13 +27,33 @@ on:
         type: boolean
         default: false
       hardened_profile:
-        description: 'Hardened image contract: worker, frontend, or api (private modules and HTTP/MongoDB/RabbitMQ checks)'
+        description: 'Runtime contract: worker, frontend, api, standalone, or mongo-task'
         type: string
         default: worker
       hardened_entrypoint:
-        description: 'Expected image Entrypoint as a JSON string array; preserves existing executable paths'
+        description: 'Expected image Entrypoint as a JSON string array or null; null requires hardened_command'
         type: string
         default: '["/app/main"]'
+      hardened_command:
+        description: 'Optional expected Cmd JSON array; required when the image has no entrypoint'
+        type: string
+        default: ''
+      hardened_workdir:
+        description: 'Optional expected absolute image working directory'
+        type: string
+        default: ''
+      browser_inventory:
+        description: 'Require extracted browser dependency scans/SBOM for a non-frontend runtime'
+        type: boolean
+        default: false
+      hardened_dockerfile:
+        description: 'Optional Dockerfile path for hardened native builds; empty preserves the context default'
+        type: string
+        default: ''
+      worker_additional_smoke:
+        description: 'Require image/smoke-test.sh in addition to worker queue readiness'
+        type: boolean
+        default: false
       publish:
         description: 'Publish verified images; false runs hardened validation only'
         type: boolean
@@ -212,15 +232,40 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           PROFILE: ${{ inputs.hardened_profile }}
           EXPECTED_ENTRYPOINT: ${{ inputs.hardened_entrypoint }}
+          EXPECTED_COMMAND: ${{ inputs.hardened_command }}
+          EXPECTED_WORKDIR: ${{ inputs.hardened_workdir }}
           MODULE_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
+          ADDITIONAL_SMOKE: ${{ inputs.worker_additional_smoke }}
         run: |
-          if ! jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' \
+          if ! jq -es 'length == 1 and (.[0] | . == null or (type == "array" and all(.[]; type == "string" and length > 0)))' \
             <<< "$EXPECTED_ENTRYPOINT" > /dev/null; then
-            echo "::error::hardened_entrypoint must be a non-empty JSON array of non-empty strings"
+            echo "::error::hardened_entrypoint must be null or a JSON array of non-empty strings"
             exit 1
           fi
-          if [ "$PROFILE" != worker ] && [ "$PROFILE" != frontend ] && [ "$PROFILE" != api ]; then
-            echo "::error::unknown hardened image profile: $PROFILE"
+          if [ -n "$EXPECTED_COMMAND" ] && ! jq -es 'length == 1 and (.[0] | type == "array" and all(.[]; type == "string" and length > 0))' \
+            <<< "$EXPECTED_COMMAND" > /dev/null; then
+            echo "::error::hardened_command must be a JSON array of non-empty strings"
+            exit 1
+          fi
+          if jq -e '. == null or length == 0' <<< "$EXPECTED_ENTRYPOINT" > /dev/null; then
+            if [ -z "$EXPECTED_COMMAND" ] || ! jq -e 'length > 0' <<< "$EXPECTED_COMMAND" > /dev/null; then
+              echo "::error::hardened_entrypoint without an executable requires a non-empty hardened_command"
+              exit 1
+            fi
+          fi
+          if [ -n "$EXPECTED_WORKDIR" ] && [[ "$EXPECTED_WORKDIR" != /* ]]; then
+            echo "::error::hardened_workdir must be an absolute path"
+            exit 1
+          fi
+          case "$PROFILE" in
+            worker|frontend|api|standalone|mongo-task) ;;
+            *)
+              echo "::error::unknown hardened image profile: $PROFILE"
+              exit 1
+              ;;
+          esac
+          if [ "$ADDITIONAL_SMOKE" = true ] && [ "$PROFILE" != worker ]; then
+            echo "::error::worker_additional_smoke is only supported for worker images"
             exit 1
           fi
           if [ "$PROFILE" = worker ] && [ -z "$SMOKE_QUEUE" ]; then
@@ -269,7 +314,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     services:
       mongodb:
-        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') && 'mongo:8' || '' }}
+        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api' || inputs.hardened_profile == 'mongo-task') && 'mongo:8' || '' }}
         ports: ["27017:27017"]
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
@@ -291,8 +336,12 @@ jobs:
       - name: Run native tests and vulnerability reachability checks
         env:
           GH_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
+          DOCKERFILE: ${{ inputs.hardened_dockerfile }}
         run: |
           args=()
+          if [ -n "$DOCKERFILE" ]; then
+            args+=(--file "$DOCKERFILE")
+          fi
           if [ -n "$GH_TOKEN" ]; then
             args+=(--secret "id=github_token,env=GH_TOKEN")
           fi
@@ -311,6 +360,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.docker_context }}
+          file: ${{ inputs.hardened_dockerfile }}
           load: true
           tags: hardened:scan
           secrets: ${{ inputs.use_private_module_auth && secrets.TOKEN != '' && format('github_token={0}', secrets.TOKEN) || '' }}
@@ -322,17 +372,26 @@ jobs:
         env:
           PROFILE: ${{ inputs.hardened_profile }}
           EXPECTED_ENTRYPOINT: ${{ inputs.hardened_entrypoint }}
+          EXPECTED_COMMAND: ${{ inputs.hardened_command }}
+          EXPECTED_WORKDIR: ${{ inputs.hardened_workdir }}
+          BROWSER_INVENTORY: ${{ inputs.hardened_profile == 'frontend' || inputs.browser_inventory }}
         run: |
           docker image inspect hardened:scan > image-inspect.json
           test "$(docker image inspect hardened:scan --format '{{.Config.User}}')" = 65532:65532
           test "$(docker image inspect hardened:scan --format '{{.Architecture}}')" = "${{ matrix.architecture }}"
           test "$(docker image inspect hardened:scan --format '{{json .Config.Entrypoint}}')" = "$(jq -c . <<< "$EXPECTED_ENTRYPOINT")"
+          if [ -n "$EXPECTED_COMMAND" ]; then
+            test "$(docker image inspect hardened:scan --format '{{json .Config.Cmd}}')" = "$(jq -c . <<< "$EXPECTED_COMMAND")"
+          fi
+          if [ -n "$EXPECTED_WORKDIR" ]; then
+            test "$(docker image inspect hardened:scan --format '{{.Config.WorkingDir}}')" = "$EXPECTED_WORKDIR"
+          fi
           container=$(docker create hardened:scan)
           docker export "$container" -o rootfs.tar
           docker rm "$container"
           tar -tf rootfs.tar > rootfs-files.txt
           tar -tvf rootfs.tar > rootfs-permissions.txt
-          if [ "$PROFILE" = frontend ]; then
+          if [ "$BROWSER_INVENTORY" = true ]; then
             mkdir frontend-inventory
             tar -xOf rootfs.tar usr/share/frontend/package.json > frontend-inventory/package.json
             tar -xOf rootfs.tar usr/share/frontend/package-lock.json > frontend-inventory/package-lock.json
@@ -386,6 +445,16 @@ jobs:
           CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
           RABBITMQ_CONTAINER: ${{ job.services.rabbitmq.id }}
         run: bash image/smoke-test.sh hardened:scan
+      - name: Smoke test repository runtime contract
+        if: inputs.hardened_profile == 'standalone' || inputs.hardened_profile == 'mongo-task' || (inputs.hardened_profile == 'worker' && inputs.worker_additional_smoke)
+        env:
+          CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          SMOKE_QUEUE: ${{ inputs.smoke_queue }}
+          RABBITMQ_CONTAINER: ${{ job.services.rabbitmq.id }}
+          GH_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
+          RUNTIME_EVIDENCE_DIR: runtime-evidence
+          DOCKERFILE: ${{ inputs.hardened_dockerfile }}
+        run: bash image/smoke-test.sh hardened:scan
       - name: Scan final image
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
@@ -399,7 +468,7 @@ jobs:
           output: image-security.json
           exit-code: "0"
       - name: Scan browser dependency inventory
-        if: inputs.hardened_profile == 'frontend'
+        if: inputs.hardened_profile == 'frontend' || inputs.browser_inventory
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
           version: v0.76.1
@@ -420,7 +489,7 @@ jobs:
           format: spdx-json
           output: image.spdx.json
       - name: Generate browser dependency SPDX SBOM
-        if: inputs.hardened_profile == 'frontend'
+        if: inputs.hardened_profile == 'frontend' || inputs.browser_inventory
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
           version: v0.76.1
@@ -430,10 +499,10 @@ jobs:
           output: browser.spdx.json
       - name: Enforce vulnerability and secret policy
         env:
-          PROFILE: ${{ inputs.hardened_profile }}
+          BROWSER_INVENTORY: ${{ inputs.hardened_profile == 'frontend' || inputs.browser_inventory }}
         run: |
           reports=(image-security.json)
-          if [ "$PROFILE" = frontend ]; then
+          if [ "$BROWSER_INVENTORY" = true ]; then
             reports+=(browser-security.json)
           fi
           jq -se '[.[].Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' "${reports[@]}"
@@ -449,6 +518,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.docker_context }}
+          file: ${{ inputs.hardened_dockerfile }}
           push: true
           secrets: ${{ inputs.use_private_module_auth && secrets.TOKEN != '' && format('github_token={0}', secrets.TOKEN) || '' }}
           tags: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform:staging-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}
@@ -499,6 +569,8 @@ jobs:
             digest-*.txt
             base-images.txt
             smoke.log
+            *-smoke.log
+            runtime-evidence
 
   hardened-manifest:
     if: inputs.hardened && inputs.publish

@@ -256,11 +256,53 @@ The expected image entrypoint defaults to `["/app/main"]`. To retain an existing
 executable path, set `hardened_entrypoint` to its JSON array, for example
 `'["./hub-pipeline-counting"]'`. Inspection must match that exact array; the
 numeric identity, runtime file gates, smoke tests and scan gates still apply.
+For a CMD-only image, set `hardened_entrypoint: 'null'` and an explicit
+`hardened_command`, for example `'["./main"]'`. Both actual metadata fields are
+then checked independently; they are not conflated into a combined argument
+array. Null/empty entrypoints without a non-empty command are rejected.
+Set `hardened_workdir` to assert a required absolute working directory without
+changing existing callers' defaults.
 
 Go binaries may use `-ldflags="-w -buildid="` to omit DWARF debug information
 while retaining Go symbols and build/module information for vulnerability
 analysis. Do not add `-s` or run a stripping tool. Both source and actual-binary
 `govulncheck` remain required after applying these flags.
+
+### Additional runtime contracts
+
+Use `hardened_profile: standalone` for CLI, scheduler or HTTP images whose
+repository smoke needs no shared databases or queues. Use `mongo-task` when the
+smoke requires only the isolated MongoDB service (for example retention
+cleanup). Both profiles must provide `image/smoke-test.sh hardened:scan`; it
+must exercise the actual image with read-only root, dropped capabilities,
+no-new-privileges and only explicitly required writable paths. Never point smoke
+at production resources or send real notifications. Missing/failed smoke blocks
+scans and publication; the common identity, file, vulnerability, secret, SBOM,
+provenance, signing and promotion gates remain mandatory.
+
+An application such as Vault that also ships browser assets must set
+`browser_inventory: true` and include its inventory at the same
+`/usr/share/frontend/package.json` and `package-lock.json` paths as the frontend.
+Extraction, scanning, policy enforcement and browser SPDX generation then apply
+regardless of runtime profile; frontend always requires them.
+
+For native media workers, `worker_additional_smoke: true` requires that same
+repository script **after** the existing queue readiness check. This is not a
+replacement for queue checks: use it to verify the actual image's FFmpeg/OpenCV
+or other native resources with a small local fixture. It is rejected for other
+profiles rather than silently ignored.
+Repository smoke receives `RUNTIME_EVIDENCE_DIR=runtime-evidence`; use it for
+native test reports. The workflow retains that directory and `*-smoke.log` files
+alongside the common evidence. Private native-test builds must use the provided
+`GH_TOKEN` environment value only through a BuildKit secret, never command-line
+credentials.
+
+Set `hardened_dockerfile` only when validating a non-default Dockerfile. The
+native test target, inspection image and published image all use that same
+file; an empty value preserves the Dockerfile selected by the build context.
+Each selected Dockerfile must expose the `test` target. Different variants
+still need distinct consumer jobs/publication destinations to avoid image and
+artifact collisions; this input does not invent new release variants.
 
 ### Hardened frontend releases
 
