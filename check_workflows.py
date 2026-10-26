@@ -189,7 +189,7 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     )
     if (
         native_tests.get("env", {}).get("GH_TOKEN") != "${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}"
-        or "--secret id=github_token,env=GH_TOKEN" not in native_tests.get("run", "")
+        or '--secret "id=github_token,env=GH_TOKEN"' not in native_tests.get("run", "")
     ):
         errors.append("release-create.yml: native tests require scoped BuildKit module secrets")
     browser_scan = next(
@@ -313,7 +313,7 @@ def validate_buildkit_auth_workflow(data: dict, errors: list[str], name: str) ->
     steps = [step for job in data["jobs"].values() for step in job.get("steps", [])]
     build = next((step for step in steps if step.get("name") == "Run Build"), {})
     if (
-        "--secret id=github_token,env=GH_TOKEN" not in build.get("run", "")
+        '--secret "id=github_token,env=GH_TOKEN"' not in build.get("run", "")
         or build.get("env", {}).get("GH_TOKEN") != "${{ secrets.TOKEN }}"
     ):
         errors.append(f"{name}: BuildKit credential mode must use the TOKEN environment secret")

@@ -110,7 +110,7 @@ jobs:
           args=(--build-arg "project=${{ env.PROJECT }}")
           if [ "${{ inputs.use_buildkit_secrets }}" = true ]; then
             test -n "$GH_TOKEN" || { echo "::error::TOKEN is required for BuildKit module authentication"; exit 1; }
-            args+=(--secret id=github_token,env=GH_TOKEN)
+            args+=(--secret "id=github_token,env=GH_TOKEN")
           else
             args+=(--build-arg "github_username=${{ secrets.USERNAME }}" --build-arg "github_token=${{ secrets.TOKEN }}")
           fi

@@ -279,7 +279,7 @@ jobs:
         run: |
           args=()
           if [ -n "$GH_TOKEN" ]; then
-            args+=(--secret id=github_token,env=GH_TOKEN)
+            args+=(--secret "id=github_token,env=GH_TOKEN")
           fi
           docker buildx build "${args[@]}" --target test --progress=plain "$BUILD_CONTEXT"
       - name: Release metadata
