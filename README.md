@@ -180,7 +180,9 @@ This profile expects a Dockerfile `test` stage running native tests and
 source/binary reachability checks, an image running as `65532:65532` with
 entrypoint `/app/main`, and a MongoDB/RabbitMQ worker exposing `/metrics` on
 port 8080. Builds, read-only/no-capability smoke tests, source secret/config
-checks, and medium/high/critical image gates precede publishing. Native registry
+checks, and medium/high/critical image gates precede publishing. Every detected
+image or browser secret blocks publication, even with LOW, UNKNOWN or missing
+severity; LOW/UNKNOWN vulnerabilities remain visible but nonblocking. Native registry
 rescans use the explicit platform. SBOMs, maximum provenance and verified
 keyless signatures precede GitOps promotion. All evidence remains in Actions
 artifacts; signing identities use

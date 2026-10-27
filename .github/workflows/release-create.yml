@@ -576,7 +576,7 @@ jobs:
           if [ "$BROWSER_INVENTORY" = true ]; then
             reports+=(browser-security.json)
           fi
-          jq -se '[.[].Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' "${reports[@]}"
+          jq -se '[.[].Results[]? | ((.Vulnerabilities[]? | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")), .Secrets[]?)] | length == 0' "${reports[@]}"
       - uses: docker/login-action@v3
         if: inputs.publish
         with:
@@ -622,7 +622,7 @@ jobs:
               exit 1
             fi
           fi
-          jq -e '[.Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' published-image-security.json
+          jq -e '[.Results[]? | ((.Vulnerabilities[]? | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")), .Secrets[]?)] | length == 0' published-image-security.json
       - name: Record immutable digest and base references
         if: inputs.publish
         env:

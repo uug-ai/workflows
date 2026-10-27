@@ -715,6 +715,36 @@ esac
                     self.assertEqual(events, [])
                     self.assertFalse(verified)
 
+    def test_every_image_secret_blocks_regardless_of_severity(self):
+        for gate in (self.image_gate, self.registry_gate):
+            for secret in (
+                {"Severity": "LOW"}, {"Severity": "UNKNOWN"},
+                {"Severity": None}, {"RuleID": "fixture-without-severity"},
+            ):
+                with self.subTest(gate=gate[:30], secret=secret):
+                    result, events, verified = self.execute(
+                        [gate, *self.manifest_scripts()],
+                        report={"Results": [{"Secrets": [secret]}]},
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(events, [])
+                    self.assertFalse(verified)
+
+    def test_every_browser_secret_blocks_even_when_image_is_clean(self):
+        for secret in (
+            {"Severity": "LOW"}, {"Severity": "UNKNOWN"},
+            {"Severity": None}, {"RuleID": "fixture-without-severity"},
+        ):
+            with self.subTest(secret=secret):
+                result, events, verified = self.execute(
+                    [self.image_gate, *self.manifest_scripts()],
+                    profile="frontend", report={"Results": []},
+                    browser_report={"Results": [{"Secrets": [secret]}]},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(events, [])
+                self.assertFalse(verified)
+
     def test_browser_findings_block_even_when_os_image_scan_is_clean(self):
         for severity in ("MEDIUM", "HIGH", "CRITICAL"):
             with self.subTest(severity=severity):
