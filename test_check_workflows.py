@@ -29,6 +29,22 @@ class ReleaseContractsTest(unittest.TestCase):
     def test_current_release_contract(self):
         self.assertEqual(self.errors(self.workflow), [])
 
+    def test_apk_catalog_gate_cannot_be_removed_skipped_or_moved_after_publication(self):
+        for change in ("remove", "conditional", "before-sbom", "after-publish"):
+            with self.subTest(change=change):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow["jobs"]["hardened-images"]["steps"]
+                gate = next(step for step in steps if step.get("name") == "Verify installed APK catalog completeness")
+                if change == "conditional":
+                    gate["if"] = "false"
+                else:
+                    steps.remove(gate)
+                    if change != "remove":
+                        target = "Generate SPDX SBOM" if change == "before-sbom" else "Publish staged image with provenance and SBOM"
+                        index = next(i for i, step in enumerate(steps) if step.get("name") == target)
+                        steps.insert(index if change == "before-sbom" else index + 1, gate)
+                self.assertTrue(self.errors(workflow))
+
     def test_legacy_defaults_cannot_enable_hardening_or_disable_publication(self):
         for key, value in (("hardened", True), ("publish", False), ("finalize_release", True)):
             with self.subTest(key=key):
@@ -593,11 +609,17 @@ esac
             step["run"] for step in workflow["jobs"]["hardened-images"]["steps"]
             if step.get("name") == "Enforce vulnerability and secret policy"
         )
+        self.apk_gate = next(
+            step["run"] for step in workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Verify installed APK catalog completeness"
+        )
         bump = load_yaml(WORKFLOWS_DIR / "release-bump.yml")
         self.bump_script = bump["jobs"]["bump-release"]["steps"][-1]["run"]
 
     def execute(self, scripts, fail_at="", draft_state="true", draft="true", report=None,
-                profile="worker", browser_report=None, browser_inventory=False, rootfs_files=""):
+                profile="worker", browser_report=None, browser_inventory=False, rootfs_files="",
+                apk_database=None, spdx_report=None, published_report=None,
+                apk_path="lib/apk/db/installed"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for command in ("docker", "cosign", "gh", "git"):
@@ -613,6 +635,15 @@ esac
                 (root / "browser-security.json").write_text(json.dumps(browser_report))
             if rootfs_files is not None:
                 (root / "rootfs-files.txt").write_text(rootfs_files)
+            if apk_database is not None:
+                database = root / "installed"
+                database.write_text(apk_database)
+                with tarfile.open(root / "rootfs.tar", "w") as archive:
+                    archive.add(database, arcname=apk_path)
+            if spdx_report is not None:
+                (root / "image.spdx.json").write_text(json.dumps(spdx_report))
+            if published_report is not None:
+                (root / "published-image-security.json").write_text(json.dumps(published_report))
             env = dict(
                 os.environ,
                 PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
@@ -642,16 +673,126 @@ esac
             events = event_log.read_text().splitlines() if event_log.exists() else []
             return result, events, (root / "verified-digest.txt").exists()
 
+    def apk_fixture(self, packages=None):
+        if packages is None:
+            packages = [
+                {"Name": "glibc", "Version": "2.42-r2"},
+                {"Name": "librdkafka", "Version": "2.16.0-r0"},
+            ]
+        database = "".join(f"P:{p['Name']}\nV:{p['Version']}\n\n" for p in packages)
+        report = {
+            "Metadata": {"OS": {"Family": "wolfi", "EOSL": False}},
+            "Results": [{"Class": "os-pkgs", "Packages": packages}],
+        }
+        spdx = {"packages": [
+            {"name": p["Name"], "versionInfo": p["Version"], "externalRefs": [
+                {"referenceType": "purl", "referenceLocator": f"pkg:apk/wolfi/{p['Name']}@{p['Version']}"}
+            ]} for p in packages
+        ]}
+        return database, report, spdx
+
+    def test_complete_apk_catalogs_pass_for_normal_and_relative_archive_paths(self):
+        database, report, spdx = self.apk_fixture()
+        for path in ("lib/apk/db/installed", "./lib/apk/db/installed",
+                     "usr/lib/apk/db/installed", "./usr/lib/apk/db/installed"):
+            with self.subTest(path=path):
+                result, _, _ = self.execute(
+                    [self.apk_gate, self.registry_gate], report=report, spdx_report=spdx,
+                    apk_database=database, rootfs_files=path + "\n", apk_path=path,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_incomplete_or_incorrect_scanner_and_spdx_catalogs_fail(self):
+        for catalog in ("scanner", "spdx"):
+            for corruption in ("missing", "extra", "version", "empty"):
+                with self.subTest(catalog=catalog, corruption=corruption):
+                    database, report, spdx = self.apk_fixture()
+                    packages = report["Results"][0]["Packages"] if catalog == "scanner" else spdx["packages"]
+                    if corruption == "missing":
+                        packages.pop()
+                    elif corruption == "extra":
+                        package = copy.deepcopy(packages[0])
+                        package["Name" if catalog == "scanner" else "name"] = "unexpected"
+                        packages.append(package)
+                    elif corruption == "version":
+                        packages[0]["Version" if catalog == "scanner" else "versionInfo"] = "wrong"
+                    else:
+                        packages.clear()
+                    result, _, _ = self.execute(
+                        [self.apk_gate], report=report, spdx_report=spdx,
+                        apk_database=database, rootfs_files="lib/apk/db/installed\n",
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_missing_empty_and_malformed_apk_database_fail(self):
+        _, report, spdx = self.apk_fixture()
+        for database in (None, "", "P:glibc\nV:\n", "V:2.42-r2\n"):
+            with self.subTest(database=database):
+                result, _, _ = self.execute(
+                    [self.apk_gate], report=report, spdx_report=spdx,
+                    apk_database=database, rootfs_files="lib/apk/db/installed\n",
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_missing_or_malformed_apk_reports_fail(self):
+        for catalog in ("scanner", "spdx"):
+            for corruption in (None, {}):
+                with self.subTest(catalog=catalog, corruption=corruption):
+                    database, report, spdx = self.apk_fixture()
+                    result, _, _ = self.execute(
+                        [self.apk_gate],
+                        report=corruption if catalog == "scanner" else report,
+                        spdx_report=corruption if catalog == "spdx" else spdx,
+                        apk_database=database, rootfs_files="lib/apk/db/installed\n",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_non_apk_images_do_not_require_apk_evidence(self):
+        for files in ("", "var/lib/dpkg/status\n"):
+            with self.subTest(files=files):
+                result, _, _ = self.execute([self.apk_gate], rootfs_files=files)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result, _, _ = self.execute([self.apk_gate], rootfs_files=None)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_published_apk_catalog_cannot_omit_or_change_installed_packages(self):
+        for corruption in ("missing", "extra", "version", "empty"):
+            with self.subTest(corruption=corruption):
+                database, report, spdx = self.apk_fixture()
+                published = copy.deepcopy(report)
+                packages = published["Results"][0]["Packages"]
+                if corruption == "missing":
+                    packages.pop()
+                elif corruption == "extra":
+                    packages.append({"Name": "unexpected", "Version": "1"})
+                elif corruption == "version":
+                    packages[0]["Version"] = "wrong"
+                else:
+                    packages.clear()
+                result, _, _ = self.execute(
+                    [self.apk_gate, self.registry_gate], report=report, spdx_report=spdx,
+                    published_report=published, apk_database=database,
+                    rootfs_files="lib/apk/db/installed\n",
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_published_apk_catalog_requires_prior_installed_package_evidence(self):
+        _, report, _ = self.apk_fixture()
+        result, _, _ = self.execute(
+            [self.registry_gate], report=report, rootfs_files="lib/apk/db/installed\n",
+        )
+        self.assertNotEqual(result.returncode, 0)
+
     def test_native_package_databases_require_supported_scanned_os_inventory(self):
         for gate in (self.image_gate, self.registry_gate):
             for database in ("var/lib/dpkg/status", "var/lib/dpkg/status.d/libc6",
                              "lib/apk/db/installed"):
                 for family, eosl, packages, expected in (
-                    ("debian", False, [{"Name": "libc6"}], 0),
-                    ("wolfi", False, [{"Name": "glibc"}], 0),
-                    ("none", False, [{"Name": "libc6"}], 1),
-                    ("", False, [{"Name": "libc6"}], 1),
-                    ("debian", True, [{"Name": "libc6"}], 1),
+                    ("debian", False, [{"Name": "libc6", "Version": "1"}], 0),
+                    ("wolfi", False, [{"Name": "glibc", "Version": "1"}], 0),
+                    ("none", False, [{"Name": "libc6", "Version": "1"}], 1),
+                    ("", False, [{"Name": "libc6", "Version": "1"}], 1),
+                    ("debian", True, [{"Name": "libc6", "Version": "1"}], 1),
                     ("debian", False, [], 1),
                 ):
                     with self.subTest(database=database, family=family, eosl=eosl,
@@ -660,8 +801,14 @@ esac
                             "Metadata": {"OS": {"Family": family, "EOSL": eosl}},
                             "Results": [{"Class": "os-pkgs", "Packages": packages}],
                         }
+                        scripts = [gate]
+                        fixture = {}
+                        if database == "lib/apk/db/installed":
+                            raw, _, spdx = self.apk_fixture(packages)
+                            fixture = {"apk_database": raw, "spdx_report": spdx}
+                            scripts.insert(0, self.apk_gate)
                         result, _, _ = self.execute(
-                            [gate], report=report, rootfs_files=database + "\n",
+                            scripts, report=report, rootfs_files=database + "\n", **fixture,
                         )
                         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 

@@ -561,6 +561,42 @@ jobs:
           scan-ref: frontend-inventory
           format: spdx-json
           output: browser.spdx.json
+      - name: Verify installed APK catalog completeness
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          test -f rootfs-files.txt
+          if database=$(grep -E '^(\./)?(usr/)?lib/apk/db/installed$' rootfs-files.txt); then
+            mkdir -p runtime-evidence
+            tar -xOf rootfs.tar "$database" > runtime-evidence/release-apk-installed
+            awk '
+              /^$/ { package = "" }
+              /^P:/ { package = substr($0, 3) }
+              /^V:/ {
+                if (package == "" || length($0) <= 2) {
+                  print "::error::invalid installed APK name/version record" > "/dev/stderr"
+                  exit 1
+                }
+                print package "\t" substr($0, 3)
+              }
+            ' runtime-evidence/release-apk-installed | sort -u > runtime-evidence/release-apk-pairs.tsv
+            if [ ! -s runtime-evidence/release-apk-pairs.tsv ]; then
+              echo "::error::installed APK database contains no package name/version pairs"
+              exit 1
+            fi
+            jq -r '.Results[] | select(.Class == "os-pkgs") | .Packages[] | [.Name, .Version] | @tsv' \
+              image-security.json | sort -u > runtime-evidence/release-scanner-os-pairs.tsv
+            jq -r '.packages[] | select(any(.externalRefs[]?; .referenceType == "purl" and (.referenceLocator | startswith("pkg:apk/")))) | [.name, .versionInfo] | @tsv' \
+              image.spdx.json | sort -u > runtime-evidence/release-spdx-os-pairs.tsv
+            for catalog in scanner spdx; do
+              if ! diff -u runtime-evidence/release-apk-pairs.tsv "runtime-evidence/release-$catalog-os-pairs.tsv"; then
+                echo "::error::installed APK packages do not equal the $catalog inventory"
+                exit 1
+              fi
+            done
+          else
+            echo "No installed APK database; APK catalog equality does not apply"
+          fi
       - name: Enforce vulnerability and secret policy
         env:
           BROWSER_INVENTORY: ${{ inputs.hardened_profile == 'frontend' || inputs.browser_inventory }}
@@ -615,10 +651,24 @@ jobs:
       - name: Gate immutable published image
         if: inputs.publish
         run: |
+          set -euo pipefail
+          export LC_ALL=C
           test -f rootfs-files.txt
           if grep -Eq '(^|/)(lib/apk/db/installed|var/lib/dpkg/status|var/lib/dpkg/status\.d(/.*)?)/?$' rootfs-files.txt; then
             if ! jq -e "$NATIVE_INVENTORY_POLICY" published-image-security.json; then
               echo "::error::published runtime package database requires supported OS detection and scanned OS packages"
+              exit 1
+            fi
+          fi
+          if grep -Eq '^(\./)?(usr/)?lib/apk/db/installed$' rootfs-files.txt; then
+            if [ ! -s runtime-evidence/release-apk-pairs.tsv ]; then
+              echo "::error::installed APK package evidence is missing"
+              exit 1
+            fi
+            jq -r '.Results[] | select(.Class == "os-pkgs") | .Packages[] | [.Name, .Version] | @tsv' \
+              published-image-security.json | sort -u > runtime-evidence/release-published-os-pairs.tsv
+            if ! diff -u runtime-evidence/release-apk-pairs.tsv runtime-evidence/release-published-os-pairs.tsv; then
+              echo "::error::published APK scan does not match the inspected installed packages"
               exit 1
             fi
           fi

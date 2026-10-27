@@ -323,6 +323,13 @@ files in the builder, then copy that tree without a recursive chmod. A passing
 host-IP service smoke alone does not establish working DNS or TLS.
 When the image contains an APK or dpkg package database, both local and
 immutable-published scans must detect a supported OS and enumerate OS packages.
+For APK runtimes, the installed name/version set extracted from the inspected
+root filesystem must exactly equal both the OS scan and native SPDX package
+sets before staging publication. The immutable-published OS scan must match
+that installed set as well; empty, missing, extra or version-mismatched
+inventories fail closed. These comparisons and the raw APK database are
+retained in `runtime-evidence/release-*`. This does not inventory statically
+bundled native archives or establish equivalent dpkg set coverage.
 An unsupported/EOL OS or a Go-only result cannot certify copied native
 libraries. Retain the matching distribution identity and package metadata;
 repository-native inventory checks must additionally cover the actual copied

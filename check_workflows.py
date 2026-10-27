@@ -307,6 +307,16 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         if step.get("name") in ("Enforce vulnerability and secret policy", "Gate immutable published image"):
             if '"$NATIVE_INVENTORY_POLICY"' not in step.get("run", ""):
                 errors.append("release-create.yml: local and published package inventories must be scanned")
+    apk_catalog = next(
+        (step for step in steps if step.get("name") == "Verify installed APK catalog completeness"),
+        {},
+    )
+    if apk_catalog.get("if") or any(
+        evidence not in apk_catalog.get("run", "")
+        for evidence in ("rootfs.tar", "image-security.json", "image.spdx.json",
+                         "runtime-evidence/release-apk-pairs.tsv", "diff -u")
+    ):
+        errors.append("release-create.yml: installed APK catalogs require an unconditional exact-set gate")
     names = [step.get("name") for step in steps]
     required_order = [
         "Run native tests and vulnerability reachability checks",
@@ -317,6 +327,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         "Smoke test API HTTP and database readiness",
         "Smoke test repository runtime contract",
         "Scan browser dependency inventory",
+        "Generate SPDX SBOM",
+        "Verify installed APK catalog completeness",
         "Enforce vulnerability and secret policy",
         "Publish staged image with provenance and SBOM",
         "Scan immutable published image",
