@@ -30,6 +30,10 @@ on:
         description: 'Runtime contract: worker, frontend, api, standalone, or mongo-task'
         type: string
         default: worker
+      artifact_prefix:
+        description: 'Unique artifact prefix for each image call; letters, digits and underscores only'
+        type: string
+        default: hardened
       hardened_entrypoint:
         description: 'Expected image Entrypoint as a JSON string array or null; null requires hardened_command'
         type: string
@@ -241,7 +245,12 @@ jobs:
           MODULE_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
           ADDITIONAL_SMOKE: ${{ inputs.worker_additional_smoke }}
           PREDECLARE_QUORUM: ${{ inputs.smoke_predeclare_quorum }}
+          ARTIFACT_PREFIX: ${{ inputs.artifact_prefix }}
         run: |
+          if [[ ! "$ARTIFACT_PREFIX" =~ ^[A-Za-z0-9_]+$ ]]; then
+            echo "::error::artifact_prefix must contain only letters, digits and underscores"
+            exit 1
+          fi
           if ! jq -es 'length == 1 and (.[0] | . == null or (type == "array" and all(.[]; type == "string" and length > 0)))' \
             <<< "$EXPECTED_ENTRYPOINT" > /dev/null; then
             echo "::error::hardened_entrypoint must be null or a JSON array of non-empty strings"
@@ -306,7 +315,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: hardened-source
+          name: ${{ inputs.artifact_prefix }}-source
           path: source-security.json
 
   hardened-images:
@@ -626,7 +635,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: hardened-image-${{ matrix.architecture }}
+          name: ${{ inputs.artifact_prefix }}-image-${{ matrix.architecture }}
           path: |
             image-security.json
             browser-security.json
@@ -650,7 +659,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: hardened-image-*
+          pattern: ${{ inputs.artifact_prefix }}-image-*
           merge-multiple: true
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -676,7 +685,7 @@ jobs:
           digest=$(docker buildx imagetools inspect "$staging" --format '{{json .Manifest.Digest}}' | tr -d '"')
           cosign sign --yes "$IMAGE@$digest"
           cosign verify \
-            --certificate-identity-regexp '^https://github.com/uug-ai/workflows/.github/workflows/release-create.yml@refs/.*$' \
+            --certificate-identity-regexp '^https://github\.com/uug-ai/workflows/\.github/workflows/release-create\.yml@(refs/\S+|[0-9a-f]{40})$' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$IMAGE@$digest" > signature-verification.json
           printf '%s\n' "$digest" > verified-digest.txt
@@ -708,7 +717,7 @@ jobs:
           promote "$IMAGE:latest" "$IMAGE" "$digest"
       - uses: actions/upload-artifact@v4
         with:
-          name: hardened-release
+          name: ${{ inputs.artifact_prefix }}-release
           path: |
             manifest.json
             image-digest.txt

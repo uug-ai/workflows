@@ -1,7 +1,9 @@
 import copy
+import fnmatch
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import tarfile
@@ -48,11 +50,64 @@ class ReleaseContractsTest(unittest.TestCase):
                             ("browser_inventory", True),
                             ("hardened_dockerfile", "Dockerfile.cv"),
                             ("worker_additional_smoke", True),
-                            ("smoke_predeclare_quorum", True)):
+                            ("smoke_predeclare_quorum", True),
+                            ("artifact_prefix", "other")):
             with self.subTest(name=name):
                 workflow = copy.deepcopy(self.workflow)
                 workflow["on"]["workflow_call"]["inputs"][name]["default"] = value
                 self.assertTrue(self.errors(workflow))
+
+    def test_artifact_namespaces_cover_all_uploads_and_manifest_downloads(self):
+        for job_id in ("hardened-source", "hardened-images", "hardened-manifest"):
+            workflow = copy.deepcopy(self.workflow)
+            upload = next(
+                step for step in workflow["jobs"][job_id]["steps"]
+                if step.get("uses", "").startswith("actions/upload-artifact@")
+            )
+            upload["with"]["name"] = "unscoped-artifact"
+            self.assertTrue(self.errors(workflow))
+        download = next(
+            step for step in self.workflow["jobs"]["hardened-manifest"]["steps"]
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        )
+        template = download["with"]["pattern"]
+        prefixes = ("hardened", "assistant_api", "assistant_worker", "hardened_image")
+        for prefix in prefixes:
+            pattern = template.replace("${{ inputs.artifact_prefix }}", prefix)
+            for other in prefixes:
+                for architecture in ("amd64", "arm64", "arm"):
+                    artifact = f"{other}-image-{architecture}"
+                    self.assertEqual(fnmatch.fnmatchcase(artifact, pattern), prefix == other)
+        download["with"]["pattern"] = "*-image-*"
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_artifact_prefix_must_reach_source_validation(self):
+        configuration = next(
+            step for step in self.workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        configuration["env"].pop("ARTIFACT_PREFIX")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_signing_accepts_owned_workflow_refs_and_full_commit_pins_only(self):
+        signing = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-manifest"]["steps"]
+            if step.get("name") == "Assemble and verify staged multi-platform manifest"
+        )
+        pattern = re.search(r"--certificate-identity-regexp '([^']+)'", signing).group(1)
+        workflow = "https://github.com/uug-ai/workflows/.github/workflows/release-create.yml@"
+        for reference in ("refs/heads/main", "refs/heads/security/image-hardening-rollout",
+                          "refs/tags/v1.0.0", "refs/pull/12/merge", "a" * 40):
+            with self.subTest(reference=reference):
+                self.assertIsNotNone(re.fullmatch(pattern, workflow + reference))
+        for identity in (
+            workflow + "a" * 39, workflow + "z" * 40, workflow + "refs/",
+            workflow.replace("github.com", "githubXcom") + "refs/heads/main",
+            workflow.replace("uug-ai/workflows", "other/workflows") + "refs/heads/main",
+            workflow.replace("release-create.yml", "other.yml") + "refs/heads/main",
+        ):
+            with self.subTest(identity=identity):
+                self.assertIsNone(re.fullmatch(pattern, identity))
 
     def test_repository_smoke_cannot_be_missing_or_unconditional(self):
         for condition in (None, "always()"):
@@ -766,13 +821,37 @@ esac
             with self.subTest(profile=profile, queue=queue):
                 result = subprocess.run(
                     ["bash", "-e", "-c", script],
-                    env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE=queue,
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE=profile, SMOKE_QUEUE=queue,
                              PRIVATE_MODULE_AUTH=auth, PUBLISH="false", RELEASE_TAG="",
                              EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="fixture-token",
                              ADDITIONAL_SMOKE="false"),
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_artifact_prefix_validation_prevents_overlapping_or_glob_namespaces(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for prefix, expected in (
+            ("hardened", 0), ("assistant_api", 0), ("assistant_worker", 0),
+            ("hardened_image", 0), ("", 1), ("hardened-image", 1),
+            ("../other", 1), ("image*", 1), ("image with space", 1),
+        ):
+            with self.subTest(prefix=prefix):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, ARTIFACT_PREFIX=prefix, PROFILE="standalone",
+                             SMOKE_QUEUE="", PRIVATE_MODULE_AUTH="false", PUBLISH="false",
+                             RELEASE_TAG="", EXPECTED_ENTRYPOINT='["/app/main"]',
+                             MODULE_TOKEN="", ADDITIONAL_SMOKE="false", PREDECLARE_QUORUM="false"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("::error::artifact_prefix", result.stdout)
 
     def test_additional_worker_smoke_cannot_be_silently_ignored(self):
         workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
@@ -785,7 +864,7 @@ esac
             with self.subTest(profile=profile):
                 result = subprocess.run(
                     ["bash", "-e", "-c", script],
-                    env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE="queue",
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE=profile, SMOKE_QUEUE="queue",
                              PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
                              EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="",
                              ADDITIONAL_SMOKE="true"),
@@ -805,7 +884,7 @@ esac
             with self.subTest(profile=profile):
                 result = subprocess.run(
                     ["bash", "-e", "-c", script],
-                    env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE="queue",
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE=profile, SMOKE_QUEUE="queue",
                              PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
                              EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="",
                              ADDITIONAL_SMOKE="false", PREDECLARE_QUORUM="true"),
@@ -832,7 +911,7 @@ esac
             with self.subTest(entrypoint=entrypoint, command=command):
                 result = subprocess.run(
                     ["bash", "-e", "-c", script],
-                    env=dict(os.environ, PROFILE="standalone", SMOKE_QUEUE="",
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE="standalone", SMOKE_QUEUE="",
                              PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
                              EXPECTED_ENTRYPOINT=entrypoint, EXPECTED_COMMAND=command,
                              MODULE_TOKEN="", ADDITIONAL_SMOKE="false"),
@@ -858,7 +937,7 @@ esac
             with self.subTest(entrypoint=entrypoint):
                 result = subprocess.run(
                     ["bash", "-e", "-c", script],
-                    env=dict(os.environ, PROFILE="worker", SMOKE_QUEUE="queue",
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE="worker", SMOKE_QUEUE="queue",
                              PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
                              EXPECTED_ENTRYPOINT=entrypoint, MODULE_TOKEN=""),
                     capture_output=True, text=True,
@@ -890,7 +969,7 @@ esac
             with self.subTest(profile=profile):
                 result = subprocess.run(
                     ["bash", "-e", "-c", script],
-                    env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE="queue",
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE=profile, SMOKE_QUEUE="queue",
                              PRIVATE_MODULE_AUTH="true", PUBLISH="false", RELEASE_TAG="",
                              EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN=""),
                     capture_output=True, text=True,

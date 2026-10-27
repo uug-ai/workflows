@@ -270,6 +270,21 @@ analysis. Do not add `-s` or run a stripping tool. Both source and actual-binary
 
 ### Additional runtime contracts
 
+When one caller workflow builds multiple images, give each reusable call a
+distinct `artifact_prefix`, such as `assistant_api` and `assistant_worker`.
+Prefixes may contain only letters, digits and underscores; the default
+`hardened` retains existing artifact names. Source, native-image and signed
+release evidence are all namespaced, and each manifest downloads only its own
+native digests. The restricted alphabet prevents overlapping wildcard prefixes.
+This isolates artifacts, not release completion: keep `finalize_release: false`
+on each image call and finalize the draft only after every required image has
+successfully completed verification and publication.
+
+Signature verification accepts the owned reusable workflow's `refs/...`
+identity or its full 40-character commit pin. It does not trust another
+repository or workflow path. Consumer verification must use the exact
+certificate identity corresponding to its chosen reusable-workflow reference.
+
 Use `hardened_profile: standalone` for CLI, scheduler or HTTP images whose
 repository smoke needs no shared databases or queues. Use `mongo-task` when the
 smoke requires only the isolated MongoDB service (for example retention

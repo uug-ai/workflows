@@ -137,6 +137,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: draft finalization must remain opt-in")
     if inputs["hardened_profile"]["default"] != "worker":
         errors.append("release-create.yml: existing hardened callers must retain the worker profile")
+    if inputs.get("artifact_prefix", {}).get("default") != "hardened":
+        errors.append("release-create.yml: existing callers must retain their artifact names")
     if inputs.get("hardened_entrypoint", {}).get("default") != '["/app/main"]':
         errors.append("release-create.yml: existing hardened callers must retain their entrypoint")
     if inputs.get("hardened_command", {}).get("default") != "":
@@ -167,6 +169,18 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     )
     if configuration.get("env", {}).get("PREDECLARE_QUORUM") != "${{ inputs.smoke_predeclare_quorum }}":
         errors.append("release-create.yml: source validation must receive the queue fixture option")
+    if configuration.get("env", {}).get("ARTIFACT_PREFIX") != "${{ inputs.artifact_prefix }}":
+        errors.append("release-create.yml: source validation must receive the artifact prefix")
+    for job_id, suffix in (("hardened-source", "source"),
+                           ("hardened-images", "image-${{ matrix.architecture }}"),
+                           ("hardened-manifest", "release")):
+        expected = "${{ inputs.artifact_prefix }}-" + suffix
+        if not any(
+            step.get("uses", "").startswith("actions/upload-artifact@")
+            and step.get("with", {}).get("name") == expected
+            for step in jobs[job_id]["steps"]
+        ):
+            errors.append(f"release-create.yml: {job_id} artifacts require the declared namespace")
     images = jobs["hardened-images"]
     if images["needs"] != "hardened-source":
         errors.append("release-create.yml: images must require source gates")
@@ -352,6 +366,12 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     if "id-token" in manifest.get("permissions", {}):
         errors.append("release-create.yml: signing must inherit the caller's optional OIDC grant")
     manifest_steps = manifest["steps"]
+    if not any(
+        step.get("uses", "").startswith("actions/download-artifact@")
+        and step.get("with", {}).get("pattern") == "${{ inputs.artifact_prefix }}-image-*"
+        for step in manifest_steps
+    ):
+        errors.append("release-create.yml: manifest assembly must isolate its image artifacts")
     manifest_names = [step.get("name") for step in manifest_steps]
     required_manifest_order = [
         "Assemble and verify staged multi-platform manifest",
