@@ -27,7 +27,7 @@ on:
         type: boolean
         default: false
       hardened_profile:
-        description: 'Hardened image contract: worker or frontend (nginx, runtime config and /tmp tmpfs)'
+        description: 'Hardened image contract: worker, frontend, or api (private modules and HTTP/MongoDB/RabbitMQ checks)'
         type: string
         default: worker
       publish:
@@ -208,7 +208,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           PROFILE: ${{ inputs.hardened_profile }}
         run: |
-          if [ "$PROFILE" != worker ] && [ "$PROFILE" != frontend ]; then
+          if [ "$PROFILE" != worker ] && [ "$PROFILE" != frontend ] && [ "$PROFILE" != api ]; then
             echo "::error::unknown hardened image profile: $PROFILE"
             exit 1
           fi
@@ -216,8 +216,8 @@ jobs:
             echo "::error::hardened releases require smoke_queue"
             exit 1
           fi
-          if [ "$PRIVATE_MODULE_AUTH" != false ]; then
-            echo "::error::hardened releases require use_private_module_auth=false; credential build arguments are not supported"
+          if [ "$PRIVATE_MODULE_AUTH" != false ] && [ "$PROFILE" != api ]; then
+            echo "::error::worker/frontend releases require use_private_module_auth=false; API authentication uses BuildKit secrets"
             exit 1
           fi
           if [ "$PUBLISH" = true ] && [ -z "$RELEASE_TAG" ]; then
@@ -254,13 +254,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     services:
       mongodb:
-        image: ${{ inputs.hardened_profile == 'worker' && 'mongo:8' || '' }}
+        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') && 'mongo:8' || '' }}
         ports: ["27017:27017"]
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
           --health-interval 5s --health-timeout 5s --health-retries 20
       rabbitmq:
-        image: ${{ inputs.hardened_profile == 'worker' && 'rabbitmq:4-alpine' || '' }}
+        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') && 'rabbitmq:4-alpine' || '' }}
         env:
           RABBITMQ_DEFAULT_USER: ci
           RABBITMQ_DEFAULT_PASS: ${{ github.run_id }}-${{ github.run_attempt }}
@@ -274,7 +274,14 @@ jobs:
           ref: ${{ inputs.tag || github.sha }}
       - uses: docker/setup-buildx-action@v3
       - name: Run native tests and vulnerability reachability checks
-        run: docker buildx build --target test --progress=plain "$BUILD_CONTEXT"
+        env:
+          GH_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
+        run: |
+          args=()
+          if [ -n "$GH_TOKEN" ]; then
+            args+=(--secret "id=github_token,env=GH_TOKEN")
+          fi
+          docker buildx build "${args[@]}" --target test --progress=plain "$BUILD_CONTEXT"
       - name: Release metadata
         id: metadata
         env:
@@ -291,6 +298,7 @@ jobs:
           context: ${{ inputs.docker_context }}
           load: true
           tags: hardened:scan
+          secrets: ${{ inputs.use_private_module_auth && secrets.TOKEN != '' && format('github_token={0}', secrets.TOKEN) || '' }}
           build-args: |
             VERSION=${{ steps.metadata.outputs.version }}
             REVISION=${{ steps.metadata.outputs.revision }}
@@ -312,6 +320,11 @@ jobs:
             mkdir frontend-inventory
             tar -xOf rootfs.tar usr/share/frontend/package.json > frontend-inventory/package.json
             tar -xOf rootfs.tar usr/share/frontend/package-lock.json > frontend-inventory/package-lock.json
+          fi
+          if [ "$PROFILE" = api ]; then
+            test "$(docker image inspect hardened:scan --format '{{json .Config.Cmd}}')" = '["serve"]'
+            test "$(docker image inspect hardened:scan --format '{{.Config.WorkingDir}}')" = /home/hub-api
+            tar -xOf rootfs.tar home/hub-api/keys/public_key.pem | cmp api/keys/public_key.pem -
           fi
           if grep -E '(^|/)(s?bin)/(sh|bash|curl|wget|apt|apk|gcc|go)$' rootfs-files.txt; then
             echo "::error::runtime contains a prohibited shell, utility or build tool"
@@ -349,6 +362,12 @@ jobs:
           test "$ready" = true
       - name: Smoke test frontend routing and runtime configuration
         if: inputs.hardened_profile == 'frontend'
+        run: bash image/smoke-test.sh hardened:scan
+      - name: Smoke test API HTTP and database readiness
+        if: inputs.hardened_profile == 'api'
+        env:
+          CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          RABBITMQ_CONTAINER: ${{ job.services.rabbitmq.id }}
         run: bash image/smoke-test.sh hardened:scan
       - name: Scan final image
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
@@ -414,6 +433,7 @@ jobs:
         with:
           context: ${{ inputs.docker_context }}
           push: true
+          secrets: ${{ inputs.use_private_module_auth && secrets.TOKEN != '' && format('github_token={0}', secrets.TOKEN) || '' }}
           tags: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform:staging-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}
           provenance: mode=max
           sbom: true

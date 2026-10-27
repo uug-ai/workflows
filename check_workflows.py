@@ -13,6 +13,10 @@ FORBIDDEN_SECRETS = {"OPENAI_API_KEY"}
 PR_DESCRIPTION_ACTION_REFERENCE = (
     "uug-ai/workflows/.github/actions/pr-description@main"
 )
+BUILD_MODULE_SECRET = (
+    "${{ inputs.use_private_module_auth && secrets.TOKEN != '' && "
+    "format('github_token={0}', secrets.TOKEN) || '' }}"
+)
 EXPECTED_WORKFLOWS = {
     "issue-userstory-create.yml",
     "pr-build.yml",
@@ -156,12 +160,38 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         (step for step in steps if step.get("name") == "Smoke test frontend routing and runtime configuration"),
         {},
     )
+    api_smoke = next(
+        (step for step in steps if step.get("name") == "Smoke test API HTTP and database readiness"),
+        {},
+    )
     if worker_smoke.get("if") != "inputs.hardened_profile == 'worker'":
         errors.append("release-create.yml: worker smoke checks must be profile-specific")
     if frontend_smoke.get("if") != "inputs.hardened_profile == 'frontend'":
         errors.append("release-create.yml: frontend routing/configuration smoke checks are required")
     if frontend_smoke.get("run") != "bash image/smoke-test.sh hardened:scan":
         errors.append("release-create.yml: frontend checks must exercise the built image")
+    if (
+        api_smoke.get("if") != "inputs.hardened_profile == 'api'"
+        or api_smoke.get("run") != "bash image/smoke-test.sh hardened:scan"
+        or api_smoke.get("env", {}).get("RABBITMQ_CONTAINER") != "${{ job.services.rabbitmq.id }}"
+    ):
+        errors.append("release-create.yml: API HTTP/database/queue checks must exercise the built image")
+    for service, image in (("mongodb", "mongo:8"), ("rabbitmq", "rabbitmq:4-alpine")):
+        expected = (
+            "${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') "
+            f"&& '{image}' || '' }}}}"
+        )
+        if images["services"][service]["image"] != expected:
+            errors.append(f"release-create.yml: {service} must run for worker/API profiles only")
+    native_tests = next(
+        (step for step in steps if step.get("name") == "Run native tests and vulnerability reachability checks"),
+        {},
+    )
+    if (
+        native_tests.get("env", {}).get("GH_TOKEN") != "${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}"
+        or '--secret "id=github_token,env=GH_TOKEN"' not in native_tests.get("run", "")
+    ):
+        errors.append("release-create.yml: native tests require scoped BuildKit module secrets")
     browser_scan = next(
         (step for step in steps if step.get("name") == "Scan browser dependency inventory"),
         {},
@@ -178,6 +208,7 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         "Inspect image contract",
         "Smoke test with a read-only filesystem and no capabilities",
         "Smoke test frontend routing and runtime configuration",
+        "Smoke test API HTTP and database readiness",
         "Scan browser dependency inventory",
         "Enforce vulnerability and secret policy",
         "Publish staged image with provenance and SBOM",
@@ -193,6 +224,12 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: hardened gates must precede promotion")
     for step in steps:
         name = step.get("name")
+        if name in ("Build final image for inspection", "Publish staged image with provenance and SBOM"):
+            options = step.get("with", {})
+            if options.get("secrets") != BUILD_MODULE_SECRET:
+                errors.append(f"release-create.yml: {name} must supply optional private modules via BuildKit secrets")
+            if re.search(r"github_(?:username|token)", options.get("build-args", "")):
+                errors.append(f"release-create.yml: {name} must not use credential build arguments")
         if name == "Publish staged image with provenance and SBOM":
             if step["with"].get("provenance") != "mode=max" or step["with"].get("sbom") is not True:
                 errors.append("release-create.yml: publishing requires provenance and SBOM")
@@ -270,6 +307,18 @@ def validate_release_bump_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-bump.yml: draft creation must remain opt-in")
 
 
+def validate_buildkit_auth_workflow(data: dict, errors: list[str], name: str) -> None:
+    if data["on"]["workflow_call"]["inputs"]["use_buildkit_secrets"]["default"] is not False:
+        errors.append(f"{name}: BuildKit credential mode must remain opt-in")
+    steps = [step for job in data["jobs"].values() for step in job.get("steps", [])]
+    build = next((step for step in steps if step.get("name") == "Run Build"), {})
+    if (
+        '--secret "id=github_token,env=GH_TOKEN"' not in build.get("run", "")
+        or build.get("env", {}).get("GH_TOKEN") != "${{ secrets.TOKEN }}"
+    ):
+        errors.append(f"{name}: BuildKit credential mode must use the TOKEN environment secret")
+
+
 def main() -> int:
     errors: list[str] = []
     workflow_names = {path.name for path in WORKFLOWS_DIR.glob("*.yml")}
@@ -286,6 +335,8 @@ def main() -> int:
     validate_pr_description_action(errors)
     validate_release_workflow(load_yaml(WORKFLOWS_DIR / "release-create.yml"), errors)
     validate_release_bump_workflow(load_yaml(WORKFLOWS_DIR / "release-bump.yml"), errors)
+    for name in ("pr-build.yml", "pr-update-environment.yml"):
+        validate_buildkit_auth_workflow(load_yaml(WORKFLOWS_DIR / name), errors, name)
 
     if errors:
         for message in errors:
