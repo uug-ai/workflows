@@ -1,9 +1,12 @@
 import copy
+import fnmatch
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
+import tarfile
 import unittest
 
 from check_workflows import (
@@ -26,6 +29,22 @@ class ReleaseContractsTest(unittest.TestCase):
     def test_current_release_contract(self):
         self.assertEqual(self.errors(self.workflow), [])
 
+    def test_apk_catalog_gate_cannot_be_removed_skipped_or_moved_after_publication(self):
+        for change in ("remove", "conditional", "before-sbom", "after-publish"):
+            with self.subTest(change=change):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow["jobs"]["hardened-images"]["steps"]
+                gate = next(step for step in steps if step.get("name") == "Verify installed APK catalog completeness")
+                if change == "conditional":
+                    gate["if"] = "false"
+                else:
+                    steps.remove(gate)
+                    if change != "remove":
+                        target = "Generate SPDX SBOM" if change == "before-sbom" else "Publish staged image with provenance and SBOM"
+                        index = next(i for i, step in enumerate(steps) if step.get("name") == target)
+                        steps.insert(index if change == "before-sbom" else index + 1, gate)
+                self.assertTrue(self.errors(workflow))
+
     def test_legacy_defaults_cannot_enable_hardening_or_disable_publication(self):
         for key, value in (("hardened", True), ("publish", False), ("finalize_release", True)):
             with self.subTest(key=key):
@@ -40,6 +59,266 @@ class ReleaseContractsTest(unittest.TestCase):
     def test_worker_profile_is_the_compatible_default(self):
         self.workflow["on"]["workflow_call"]["inputs"]["hardened_profile"]["default"] = "frontend"
         self.assertTrue(self.errors(self.workflow))
+
+    def test_new_runtime_options_preserve_existing_defaults(self):
+        for name, value in (("hardened_command", '["serve"]'),
+                            ("hardened_workdir", "/home/other"),
+                            ("browser_inventory", True),
+                            ("hardened_dockerfile", "Dockerfile.cv"),
+                            ("worker_additional_smoke", True),
+                            ("smoke_predeclare_quorum", True),
+                            ("artifact_prefix", "other")):
+            with self.subTest(name=name):
+                workflow = copy.deepcopy(self.workflow)
+                workflow["on"]["workflow_call"]["inputs"][name]["default"] = value
+                self.assertTrue(self.errors(workflow))
+
+    def test_artifact_namespaces_cover_all_uploads_and_manifest_downloads(self):
+        for job_id in ("hardened-source", "hardened-images", "hardened-manifest"):
+            workflow = copy.deepcopy(self.workflow)
+            upload = next(
+                step for step in workflow["jobs"][job_id]["steps"]
+                if step.get("uses", "").startswith("actions/upload-artifact@")
+            )
+            upload["with"]["name"] = "unscoped-artifact"
+            self.assertTrue(self.errors(workflow))
+        download = next(
+            step for step in self.workflow["jobs"]["hardened-manifest"]["steps"]
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        )
+        template = download["with"]["pattern"]
+        prefixes = ("hardened", "assistant_api", "assistant_worker", "hardened_image")
+        for prefix in prefixes:
+            pattern = template.replace("${{ inputs.artifact_prefix }}", prefix)
+            for other in prefixes:
+                for architecture in ("amd64", "arm64", "arm"):
+                    artifact = f"{other}-image-{architecture}"
+                    self.assertEqual(fnmatch.fnmatchcase(artifact, pattern), prefix == other)
+        download["with"]["pattern"] = "*-image-*"
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_artifact_prefix_must_reach_source_validation(self):
+        configuration = next(
+            step for step in self.workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        configuration["env"].pop("ARTIFACT_PREFIX")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_signing_accepts_owned_workflow_refs_and_full_commit_pins_only(self):
+        signing = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-manifest"]["steps"]
+            if step.get("name") == "Assemble and verify staged multi-platform manifest"
+        )
+        pattern = re.search(r"--certificate-identity-regexp '([^']+)'", signing).group(1)
+        workflow = "https://github.com/uug-ai/workflows/.github/workflows/release-create.yml@"
+        for reference in ("refs/heads/main", "refs/heads/security/image-hardening-rollout",
+                          "refs/tags/v1.0.0", "refs/pull/12/merge", "a" * 40):
+            with self.subTest(reference=reference):
+                self.assertIsNotNone(re.fullmatch(pattern, workflow + reference))
+        for identity in (
+            workflow + "a" * 39, workflow + "z" * 40, workflow + "refs/",
+            workflow.replace("github.com", "githubXcom") + "refs/heads/main",
+            workflow.replace("uug-ai/workflows", "other/workflows") + "refs/heads/main",
+            workflow.replace("release-create.yml", "other.yml") + "refs/heads/main",
+        ):
+            with self.subTest(identity=identity):
+                self.assertIsNone(re.fullmatch(pattern, identity))
+
+    def test_repository_smoke_cannot_be_missing_or_unconditional(self):
+        for condition in (None, "always()"):
+            with self.subTest(condition=condition):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow["jobs"]["hardened-images"]["steps"]
+                for step in steps:
+                    if step.get("name") == "Smoke test repository runtime contract":
+                        if condition is None:
+                            steps.remove(step)
+                        else:
+                            step["if"] = condition
+                        break
+                self.assertTrue(self.errors(workflow))
+
+    def test_selected_dockerfile_is_used_by_every_native_build(self):
+        for name in ("Run native tests and vulnerability reachability checks",
+                     "Build final image for inspection", "Publish staged image with provenance and SBOM"):
+            with self.subTest(name=name):
+                workflow = copy.deepcopy(self.workflow)
+                for step in workflow["jobs"]["hardened-images"]["steps"]:
+                    if step.get("name") == name:
+                        if "uses" in step:
+                            step["with"].pop("file")
+                        else:
+                            step["env"].pop("DOCKERFILE")
+                self.assertTrue(self.errors(workflow))
+
+    def test_base_evidence_uses_the_selected_or_context_dockerfile(self):
+        recording = next(
+            step for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Record immutable digest and base references"
+        )
+        lines = recording["run"].splitlines()
+        script = "\n".join(line for line in lines if "dockerfile=" in line or line.startswith("grep "))
+        for selected, expected in (("", "FROM default@sha256:default\n"),
+                                    ("custom with space.Dockerfile", "FROM selected@sha256:selected\n")):
+            with self.subTest(selected=selected):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "nested").mkdir()
+                    (root / "nested" / "Dockerfile").write_text("FROM default@sha256:default\n")
+                    (root / "custom with space.Dockerfile").write_text("FROM selected@sha256:selected\n")
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", script], cwd=root,
+                        env=dict(os.environ, BUILD_CONTEXT="nested", DOCKERFILE=selected),
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual((root / "base-images.txt").read_text(), expected)
+        recording["env"].pop("DOCKERFILE")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_existing_entrypoint_is_the_compatible_default(self):
+        self.workflow["on"]["workflow_call"]["inputs"]["hardened_entrypoint"]["default"] = '["./other"]'
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_worker_smoke_must_select_the_tested_transport(self):
+        for step in self.workflow["jobs"]["hardened-images"]["steps"]:
+            if step.get("name") == "Smoke test with a read-only filesystem and no capabilities":
+                step["run"] = step["run"].replace("-e QUEUE_SYSTEM=RABBITMQ", "")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_quorum_fixture_cannot_be_missing_or_unconditional(self):
+        for condition in (None, "always()"):
+            with self.subTest(condition=condition):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow["jobs"]["hardened-images"]["steps"]
+                fixture = next(step for step in steps if step.get("name") == "Prepare legacy worker quorum queue")
+                if condition is None:
+                    steps.remove(fixture)
+                else:
+                    fixture["if"] = condition
+                self.assertTrue(self.errors(workflow))
+
+    def test_quorum_fixture_option_must_reach_source_validation(self):
+        configuration = next(
+            step for step in self.workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        configuration["env"].pop("PREDECLARE_QUORUM")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_quorum_fixture_encodes_queue_names_and_propagates_http_errors(self):
+        script = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Prepare legacy worker quorum queue"
+        )
+        for status in (0, 22):
+            with self.subTest(status=status):
+                result = subprocess.run(
+                    ["bash", "-e", "-c",
+                     'curl() { printf "%s\\n" "$@"; return "$CURL_STATUS"; }\n' + script],
+                    env=dict(os.environ, CI_PASSWORD="fixture-password", CURL_STATUS=str(status),
+                             SMOKE_QUEUE="queue/with space?"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertIn("http://localhost:15672/api/queues/%2F/queue%2Fwith%20space%3F", result.stdout)
+                self.assertIn('{"durable":true,"arguments":{"x-queue-type":"quorum"}}', result.stdout)
+                self.assertIn("-fsS", result.stdout)
+                self.assertIn("--retry-connrefused", result.stdout)
+                self.assertIn("ci:fixture-password", result.stdout)
+
+    def test_entrypoint_inspection_cannot_ignore_the_declared_contract(self):
+        for step in self.workflow["jobs"]["hardened-images"]["steps"]:
+            if step.get("name") == "Inspect image contract":
+                step["env"].pop("EXPECTED_ENTRYPOINT")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_entrypoint_inspection_matches_the_image_not_just_valid_json(self):
+        inspection = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Inspect image contract"
+        )
+        assertion = next(
+            line for line in inspection.splitlines()
+            if "{{json .Config.Entrypoint}}" in line
+        )
+        for actual, expected, status in (
+            ('["/app/main"]', '["/app/main"]', 0),
+            ('["./hub-pipeline-counting"]', '[ "./hub-pipeline-counting" ]', 0),
+            ('["/app/main"]', '["./hub-pipeline-counting"]', 1),
+            ('null', '["/app/main"]', 1),
+        ):
+            with self.subTest(actual=actual, expected=expected):
+                result = subprocess.run(
+                    ["bash", "-e", "-c",
+                     'docker() { printf "%s\\n" "$ACTUAL_ENTRYPOINT"; }\n' + assertion],
+                    env=dict(os.environ, ACTUAL_ENTRYPOINT=actual, EXPECTED_ENTRYPOINT=expected),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def test_command_and_workdir_inspection_match_actual_metadata(self):
+        inspection = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Inspect image contract"
+        )
+        for field, variable, actual, expected, status in (
+            ("Cmd", "EXPECTED_COMMAND", '["./main"]', '["./main"]', 0),
+            ("Cmd", "EXPECTED_COMMAND", '["./other"]', '["./main"]', 1),
+            ("WorkingDir", "EXPECTED_WORKDIR", "/home/vault", "/home/vault", 0),
+            ("WorkingDir", "EXPECTED_WORKDIR", "/app", "/home/vault", 1),
+        ):
+            with self.subTest(field=field, actual=actual):
+                assertion = next(
+                    line for line in inspection.splitlines() if f".Config.{field}}}" in line
+                )
+                result = subprocess.run(
+                    ["bash", "-e", "-c",
+                     'docker() { printf "%s\\n" "$ACTUAL_METADATA"; }\n' + assertion],
+                    env=dict(os.environ, ACTUAL_METADATA=actual, **{variable: expected}),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def test_runtime_directory_and_trust_file_permissions_are_enforced(self):
+        inspection = next(
+            step["run"] for step in self.workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Inspect image contract"
+        )
+        script = inspection.split("python3 - <<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        for path, mode, uid, gid, profile, expected in (
+            ("etc", 0o755, 0, 0, "worker", 0),
+            ("etc", 0o444, 0, 0, "worker", 1),
+            ("etc/ssl", 0o444, 0, 0, "worker", 1),
+            ("etc/ssl/certs", 0o444, 0, 0, "worker", 1),
+            ("etc/ssl/certs/ca-certificates.crt", 0o444, 0, 0, "worker", 0),
+            ("etc/ssl/certs/ca-certificates.crt", 0o400, 0, 0, "worker", 1),
+            ("home/service", 0o444, 0, 0, "worker", 1),
+            ("home/service", 0o700, 65532, 0, "worker", 0),
+            ("home/service", 0o750, 0, 65532, "worker", 0),
+            ("home/service", 0o750, 0, 0, "worker", 1),
+            ("home/hub-api/keys", 0o444, 0, 0, "api", 1),
+            ("home/hub-api/keys/public_key.pem", 0o400, 0, 0, "api", 1),
+        ):
+            with self.subTest(path=path, mode=oct(mode), uid=uid, gid=gid):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "image-inspect.json").write_text(json.dumps([
+                        {"Config": {"WorkingDir": "/home/service"}},
+                    ]))
+                    with tarfile.open(root / "rootfs.tar", "w") as archive:
+                        member = tarfile.TarInfo(path)
+                        member.type = tarfile.REGTYPE if path.endswith((".crt", ".pem")) else tarfile.DIRTYPE
+                        member.mode, member.uid, member.gid = mode, uid, gid
+                        archive.addfile(member)
+                    result = subprocess.run(
+                        ["python3", "-c", script], cwd=root,
+                        env=dict(os.environ, PROFILE=profile), capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    if expected:
+                        self.assertIn("::error::runtime UID65532 cannot", result.stderr)
 
     def test_frontend_smoke_test_cannot_be_missing_or_unconditional(self):
         for condition in (None, "always()"):
@@ -330,11 +609,17 @@ esac
             step["run"] for step in workflow["jobs"]["hardened-images"]["steps"]
             if step.get("name") == "Enforce vulnerability and secret policy"
         )
+        self.apk_gate = next(
+            step["run"] for step in workflow["jobs"]["hardened-images"]["steps"]
+            if step.get("name") == "Verify installed APK catalog completeness"
+        )
         bump = load_yaml(WORKFLOWS_DIR / "release-bump.yml")
         self.bump_script = bump["jobs"]["bump-release"]["steps"][-1]["run"]
 
     def execute(self, scripts, fail_at="", draft_state="true", draft="true", report=None,
-                profile="worker", browser_report=None):
+                profile="worker", browser_report=None, browser_inventory=False, rootfs_files="",
+                apk_database=None, spdx_report=None, published_report=None,
+                apk_path="lib/apk/db/installed"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for command in ("docker", "cosign", "gh", "git"):
@@ -348,6 +633,17 @@ esac
                 (root / "image-security.json").write_text(json.dumps(report))
             if browser_report is not None:
                 (root / "browser-security.json").write_text(json.dumps(browser_report))
+            if rootfs_files is not None:
+                (root / "rootfs-files.txt").write_text(rootfs_files)
+            if apk_database is not None:
+                database = root / "installed"
+                database.write_text(apk_database)
+                with tarfile.open(root / "rootfs.tar", "w") as archive:
+                    archive.add(database, arcname=apk_path)
+            if spdx_report is not None:
+                (root / "image.spdx.json").write_text(json.dumps(spdx_report))
+            if published_report is not None:
+                (root / "published-image-security.json").write_text(json.dumps(published_report))
             env = dict(
                 os.environ,
                 PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
@@ -357,6 +653,9 @@ esac
                 DRAFT_STATE=draft_state,
                 DRAFT=draft,
                 PROFILE=profile,
+                BROWSER_INVENTORY="true" if profile == "frontend" or browser_inventory else "false",
+                NATIVE_INVENTORY_POLICY=load_yaml(WORKFLOWS_DIR / "release-create.yml")[
+                    "jobs"]["hardened-images"]["env"]["NATIVE_INVENTORY_POLICY"],
                 IMAGE="ghcr.io/uug-ai/example",
                 PLATFORM_IMAGE="ghcr.io/uug-ai/example-platform",
                 TAG="v1.2.3",
@@ -373,6 +672,155 @@ esac
             event_log = root / "events"
             events = event_log.read_text().splitlines() if event_log.exists() else []
             return result, events, (root / "verified-digest.txt").exists()
+
+    def apk_fixture(self, packages=None):
+        if packages is None:
+            packages = [
+                {"Name": "glibc", "Version": "2.42-r2"},
+                {"Name": "librdkafka", "Version": "2.16.0-r0"},
+            ]
+        database = "".join(f"P:{p['Name']}\nV:{p['Version']}\n\n" for p in packages)
+        report = {
+            "Metadata": {"OS": {"Family": "wolfi", "EOSL": False}},
+            "Results": [{"Class": "os-pkgs", "Packages": packages}],
+        }
+        spdx = {"packages": [
+            {"name": p["Name"], "versionInfo": p["Version"], "externalRefs": [
+                {"referenceType": "purl", "referenceLocator": f"pkg:apk/wolfi/{p['Name']}@{p['Version']}"}
+            ]} for p in packages
+        ]}
+        return database, report, spdx
+
+    def test_complete_apk_catalogs_pass_for_normal_and_relative_archive_paths(self):
+        database, report, spdx = self.apk_fixture()
+        for path in ("lib/apk/db/installed", "./lib/apk/db/installed",
+                     "usr/lib/apk/db/installed", "./usr/lib/apk/db/installed"):
+            with self.subTest(path=path):
+                result, _, _ = self.execute(
+                    [self.apk_gate, self.registry_gate], report=report, spdx_report=spdx,
+                    apk_database=database, rootfs_files=path + "\n", apk_path=path,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_incomplete_or_incorrect_scanner_and_spdx_catalogs_fail(self):
+        for catalog in ("scanner", "spdx"):
+            for corruption in ("missing", "extra", "version", "empty"):
+                with self.subTest(catalog=catalog, corruption=corruption):
+                    database, report, spdx = self.apk_fixture()
+                    packages = report["Results"][0]["Packages"] if catalog == "scanner" else spdx["packages"]
+                    if corruption == "missing":
+                        packages.pop()
+                    elif corruption == "extra":
+                        package = copy.deepcopy(packages[0])
+                        package["Name" if catalog == "scanner" else "name"] = "unexpected"
+                        packages.append(package)
+                    elif corruption == "version":
+                        packages[0]["Version" if catalog == "scanner" else "versionInfo"] = "wrong"
+                    else:
+                        packages.clear()
+                    result, _, _ = self.execute(
+                        [self.apk_gate], report=report, spdx_report=spdx,
+                        apk_database=database, rootfs_files="lib/apk/db/installed\n",
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_missing_empty_and_malformed_apk_database_fail(self):
+        valid_database, report, spdx = self.apk_fixture()
+        for database in (
+            None, "", "P:glibc\nV:\n", "V:2.42-r2\n",
+            valid_database + "P:omitted-version\n",
+            valid_database.replace("\n\n", "\n"),
+        ):
+            with self.subTest(database=database):
+                result, _, _ = self.execute(
+                    [self.apk_gate], report=report, spdx_report=spdx,
+                    apk_database=database, rootfs_files="lib/apk/db/installed\n",
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_missing_or_malformed_apk_reports_fail(self):
+        for catalog in ("scanner", "spdx"):
+            for corruption in (None, {}):
+                with self.subTest(catalog=catalog, corruption=corruption):
+                    database, report, spdx = self.apk_fixture()
+                    result, _, _ = self.execute(
+                        [self.apk_gate],
+                        report=corruption if catalog == "scanner" else report,
+                        spdx_report=corruption if catalog == "spdx" else spdx,
+                        apk_database=database, rootfs_files="lib/apk/db/installed\n",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_non_apk_images_do_not_require_apk_evidence(self):
+        for files in ("", "var/lib/dpkg/status\n"):
+            with self.subTest(files=files):
+                result, _, _ = self.execute([self.apk_gate], rootfs_files=files)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result, _, _ = self.execute([self.apk_gate], rootfs_files=None)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_published_apk_catalog_cannot_omit_or_change_installed_packages(self):
+        for corruption in ("missing", "extra", "version", "empty"):
+            with self.subTest(corruption=corruption):
+                database, report, spdx = self.apk_fixture()
+                published = copy.deepcopy(report)
+                packages = published["Results"][0]["Packages"]
+                if corruption == "missing":
+                    packages.pop()
+                elif corruption == "extra":
+                    packages.append({"Name": "unexpected", "Version": "1"})
+                elif corruption == "version":
+                    packages[0]["Version"] = "wrong"
+                else:
+                    packages.clear()
+                result, _, _ = self.execute(
+                    [self.apk_gate, self.registry_gate], report=report, spdx_report=spdx,
+                    published_report=published, apk_database=database,
+                    rootfs_files="lib/apk/db/installed\n",
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_published_apk_catalog_requires_prior_installed_package_evidence(self):
+        _, report, _ = self.apk_fixture()
+        result, _, _ = self.execute(
+            [self.registry_gate], report=report, rootfs_files="lib/apk/db/installed\n",
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_native_package_databases_require_supported_scanned_os_inventory(self):
+        for gate in (self.image_gate, self.registry_gate):
+            for database in ("var/lib/dpkg/status", "var/lib/dpkg/status.d/libc6",
+                             "lib/apk/db/installed"):
+                for family, eosl, packages, expected in (
+                    ("debian", False, [{"Name": "libc6", "Version": "1"}], 0),
+                    ("wolfi", False, [{"Name": "glibc", "Version": "1"}], 0),
+                    ("none", False, [{"Name": "libc6", "Version": "1"}], 1),
+                    ("", False, [{"Name": "libc6", "Version": "1"}], 1),
+                    ("debian", True, [{"Name": "libc6", "Version": "1"}], 1),
+                    ("debian", False, [], 1),
+                ):
+                    with self.subTest(database=database, family=family, eosl=eosl,
+                                      packages=packages, gate=gate[:30]):
+                        report = {
+                            "Metadata": {"OS": {"Family": family, "EOSL": eosl}},
+                            "Results": [{"Class": "os-pkgs", "Packages": packages}],
+                        }
+                        scripts = [gate]
+                        fixture = {}
+                        if database == "lib/apk/db/installed":
+                            raw, _, spdx = self.apk_fixture(packages)
+                            fixture = {"apk_database": raw, "spdx_report": spdx}
+                            scripts.insert(0, self.apk_gate)
+                        result, _, _ = self.execute(
+                            scripts, report=report, rootfs_files=database + "\n", **fixture,
+                        )
+                        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_missing_rootfs_inventory_cannot_bypass_os_package_checks(self):
+        for gate in (self.image_gate, self.registry_gate):
+            with self.subTest(gate=gate[:30]):
+                result, _, _ = self.execute([gate], report={"Results": []}, rootfs_files=None)
+                self.assertNotEqual(result.returncode, 0)
 
     def manifest_scripts(self):
         return [step["run"] for step in self.steps if "run" in step]
@@ -417,6 +865,36 @@ esac
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(events, [])
                     self.assertFalse(verified)
+
+    def test_every_image_secret_blocks_regardless_of_severity(self):
+        for gate in (self.image_gate, self.registry_gate):
+            for secret in (
+                {"Severity": "LOW"}, {"Severity": "UNKNOWN"},
+                {"Severity": None}, {"RuleID": "fixture-without-severity"},
+            ):
+                with self.subTest(gate=gate[:30], secret=secret):
+                    result, events, verified = self.execute(
+                        [gate, *self.manifest_scripts()],
+                        report={"Results": [{"Secrets": [secret]}]},
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(events, [])
+                    self.assertFalse(verified)
+
+    def test_every_browser_secret_blocks_even_when_image_is_clean(self):
+        for secret in (
+            {"Severity": "LOW"}, {"Severity": "UNKNOWN"},
+            {"Severity": None}, {"RuleID": "fixture-without-severity"},
+        ):
+            with self.subTest(secret=secret):
+                result, events, verified = self.execute(
+                    [self.image_gate, *self.manifest_scripts()],
+                    profile="frontend", report={"Results": []},
+                    browser_report={"Results": [{"Secrets": [secret]}]},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(events, [])
+                self.assertFalse(verified)
 
     def test_browser_findings_block_even_when_os_image_scan_is_clean(self):
         for severity in ("MEDIUM", "HIGH", "CRITICAL"):
@@ -515,18 +993,170 @@ esac
             ("worker", "", "false", 1),
             ("frontend", "", "false", 0),
             ("api", "", "true", 0),
-            ("worker", "queue", "true", 1),
+            ("standalone", "", "false", 0),
+            ("mongo-task", "", "false", 0),
+            ("worker", "queue", "true", 0),
             ("frontend", "", "true", 1),
             ("unknown", "queue", "false", 1),
         ):
             with self.subTest(profile=profile, queue=queue):
                 result = subprocess.run(
                     ["bash", "-e", "-c", script],
-                    env=dict(os.environ, PROFILE=profile, SMOKE_QUEUE=queue,
-                             PRIVATE_MODULE_AUTH=auth, PUBLISH="false", RELEASE_TAG=""),
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE=profile, SMOKE_QUEUE=queue,
+                             PRIVATE_MODULE_AUTH=auth, PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="fixture-token",
+                             ADDITIONAL_SMOKE="false"),
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_artifact_prefix_validation_prevents_overlapping_or_glob_namespaces(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for prefix, expected in (
+            ("hardened", 0), ("assistant_api", 0), ("assistant_worker", 0),
+            ("hardened_image", 0), ("", 1), ("hardened-image", 1),
+            ("../other", 1), ("image*", 1), ("image with space", 1),
+        ):
+            with self.subTest(prefix=prefix):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, ARTIFACT_PREFIX=prefix, PROFILE="standalone",
+                             SMOKE_QUEUE="", PRIVATE_MODULE_AUTH="false", PUBLISH="false",
+                             RELEASE_TAG="", EXPECTED_ENTRYPOINT='["/app/main"]',
+                             MODULE_TOKEN="", ADDITIONAL_SMOKE="false", PREDECLARE_QUORUM="false"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("::error::artifact_prefix", result.stdout)
+
+    def test_additional_worker_smoke_cannot_be_silently_ignored(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for profile, expected in (("worker", 0), ("frontend", 1),
+                                  ("api", 1), ("standalone", 1), ("mongo-task", 1)):
+            with self.subTest(profile=profile):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE=profile, SMOKE_QUEUE="queue",
+                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="",
+                             ADDITIONAL_SMOKE="true"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("worker_additional_smoke", result.stdout)
+
+    def test_quorum_predeclaration_is_rejected_for_nonworker_profiles(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for profile in ("worker", "frontend", "api", "standalone", "mongo-task"):
+            with self.subTest(profile=profile):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE=profile, SMOKE_QUEUE="queue",
+                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN="",
+                             ADDITIONAL_SMOKE="false", PREDECLARE_QUORUM="true"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0 if profile == "worker" else 1,
+                                 result.stdout + result.stderr)
+                if profile != "worker":
+                    self.assertIn("smoke_predeclare_quorum", result.stdout)
+
+    def test_cmd_only_images_preserve_both_parts_of_the_contract(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for entrypoint, command, expected in (
+            ("null", '["./main"]', 0), ("[]", '["./main"]', 0),
+            ("null", "", 1), ("null", "[]", 1), ("[]", "[]", 1),
+            ("null", "null", 1), ("null", '[""]', 1),
+            ("null", " ", 1), ("null", '["./main"] ["./other"]', 1),
+            ('["/app/main"]', "[]", 0),
+        ):
+            with self.subTest(entrypoint=entrypoint, command=command):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE="standalone", SMOKE_QUEUE="",
+                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT=entrypoint, EXPECTED_COMMAND=command,
+                             MODULE_TOKEN="", ADDITIONAL_SMOKE="false"),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("::error::hardened_", result.stdout)
+
+    def test_hardened_entrypoint_configuration_rejects_invalid_shapes(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for entrypoint, expected in (
+            ('["/app/main"]', 0),
+            ('[ "./hub-pipeline-counting" ]', 0),
+            ('[]', 1), ('null', 1), ('{}', 1), ('"main"', 1),
+            ('[""]', 1), ('[false]', 1), ('not-json', 1),
+            ('', 1), (' ', 1), ('["/app/main"] ["./other"]', 1),
+        ):
+            with self.subTest(entrypoint=entrypoint):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE="worker", SMOKE_QUEUE="queue",
+                             PRIVATE_MODULE_AUTH="false", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT=entrypoint, MODULE_TOKEN=""),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("::error::hardened_entrypoint", result.stdout)
+
+    def test_non_frontend_browser_inventory_is_required_and_gated(self):
+        for browser_report, expected in (
+            (None, 1), ({"Results": []}, 0),
+            ({"Results": [{"Vulnerabilities": [{"Severity": "MEDIUM"}]}]}, 1),
+        ):
+            with self.subTest(browser_report=browser_report):
+                result, _, _ = self.execute(
+                    [self.image_gate], report={"Results": []}, profile="mongo-task",
+                    browser_report=browser_report, browser_inventory=True,
+                )
+                self.assertEqual(result.returncode == 0, expected == 0,
+                                 result.stdout + result.stderr)
+
+    def test_private_module_authentication_requires_a_token(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["hardened-source"]["steps"]
+            if step.get("name") == "Validate hardened release configuration"
+        )
+        for profile in ("worker", "api"):
+            with self.subTest(profile=profile):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", script],
+                    env=dict(os.environ, ARTIFACT_PREFIX="hardened", PROFILE=profile, SMOKE_QUEUE="queue",
+                             PRIVATE_MODULE_AUTH="true", PUBLISH="false", RELEASE_TAG="",
+                             EXPECTED_ENTRYPOINT='["/app/main"]', MODULE_TOKEN=""),
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires secrets.TOKEN", result.stdout)
 
 
 if __name__ == "__main__":

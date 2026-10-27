@@ -27,9 +27,41 @@ on:
         type: boolean
         default: false
       hardened_profile:
-        description: 'Hardened image contract: worker, frontend, or api (private modules and HTTP/MongoDB/RabbitMQ checks)'
+        description: 'Runtime contract: worker, frontend, api, standalone, or mongo-task'
         type: string
         default: worker
+      artifact_prefix:
+        description: 'Unique artifact prefix for each image call; letters, digits and underscores only'
+        type: string
+        default: hardened
+      hardened_entrypoint:
+        description: 'Expected image Entrypoint as a JSON string array or null; null requires hardened_command'
+        type: string
+        default: '["/app/main"]'
+      hardened_command:
+        description: 'Optional expected Cmd JSON array; required when the image has no entrypoint'
+        type: string
+        default: ''
+      hardened_workdir:
+        description: 'Optional expected absolute image working directory'
+        type: string
+        default: ''
+      browser_inventory:
+        description: 'Require extracted browser dependency scans/SBOM for a non-frontend runtime'
+        type: boolean
+        default: false
+      hardened_dockerfile:
+        description: 'Optional Dockerfile path for hardened native builds; empty preserves the context default'
+        type: string
+        default: ''
+      worker_additional_smoke:
+        description: 'Require image/smoke-test.sh in addition to worker queue readiness'
+        type: boolean
+        default: false
+      smoke_predeclare_quorum:
+        description: 'Provision a durable quorum queue for workers that require an existing queue'
+        type: boolean
+        default: false
       publish:
         description: 'Publish verified images; false runs hardened validation only'
         type: boolean
@@ -207,17 +239,63 @@ jobs:
           PUBLISH: ${{ inputs.publish }}
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           PROFILE: ${{ inputs.hardened_profile }}
+          EXPECTED_ENTRYPOINT: ${{ inputs.hardened_entrypoint }}
+          EXPECTED_COMMAND: ${{ inputs.hardened_command }}
+          EXPECTED_WORKDIR: ${{ inputs.hardened_workdir }}
+          MODULE_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
+          ADDITIONAL_SMOKE: ${{ inputs.worker_additional_smoke }}
+          PREDECLARE_QUORUM: ${{ inputs.smoke_predeclare_quorum }}
+          ARTIFACT_PREFIX: ${{ inputs.artifact_prefix }}
         run: |
-          if [ "$PROFILE" != worker ] && [ "$PROFILE" != frontend ] && [ "$PROFILE" != api ]; then
-            echo "::error::unknown hardened image profile: $PROFILE"
+          if [[ ! "$ARTIFACT_PREFIX" =~ ^[A-Za-z0-9_]+$ ]]; then
+            echo "::error::artifact_prefix must contain only letters, digits and underscores"
+            exit 1
+          fi
+          if ! jq -es 'length == 1 and (.[0] | . == null or (type == "array" and all(.[]; type == "string" and length > 0)))' \
+            <<< "$EXPECTED_ENTRYPOINT" > /dev/null; then
+            echo "::error::hardened_entrypoint must be null or a JSON array of non-empty strings"
+            exit 1
+          fi
+          if [ -n "$EXPECTED_COMMAND" ] && ! jq -es 'length == 1 and (.[0] | type == "array" and all(.[]; type == "string" and length > 0))' \
+            <<< "$EXPECTED_COMMAND" > /dev/null; then
+            echo "::error::hardened_command must be a JSON array of non-empty strings"
+            exit 1
+          fi
+          if jq -e '. == null or length == 0' <<< "$EXPECTED_ENTRYPOINT" > /dev/null; then
+            if [ -z "$EXPECTED_COMMAND" ] || ! jq -e 'length > 0' <<< "$EXPECTED_COMMAND" > /dev/null; then
+              echo "::error::hardened_entrypoint without an executable requires a non-empty hardened_command"
+              exit 1
+            fi
+          fi
+          if [ -n "$EXPECTED_WORKDIR" ] && [[ "$EXPECTED_WORKDIR" != /* ]]; then
+            echo "::error::hardened_workdir must be an absolute path"
+            exit 1
+          fi
+          case "$PROFILE" in
+            worker|frontend|api|standalone|mongo-task) ;;
+            *)
+              echo "::error::unknown hardened image profile: $PROFILE"
+              exit 1
+              ;;
+          esac
+          if [ "$ADDITIONAL_SMOKE" = true ] && [ "$PROFILE" != worker ]; then
+            echo "::error::worker_additional_smoke is only supported for worker images"
+            exit 1
+          fi
+          if [ "$PREDECLARE_QUORUM" = true ] && [ "$PROFILE" != worker ]; then
+            echo "::error::smoke_predeclare_quorum is only supported for worker images"
             exit 1
           fi
           if [ "$PROFILE" = worker ] && [ -z "$SMOKE_QUEUE" ]; then
             echo "::error::hardened releases require smoke_queue"
             exit 1
           fi
-          if [ "$PRIVATE_MODULE_AUTH" != false ] && [ "$PROFILE" != api ]; then
-            echo "::error::worker/frontend releases require use_private_module_auth=false; API authentication uses BuildKit secrets"
+          if [ "$PRIVATE_MODULE_AUTH" != false ] && [ "$PROFILE" = frontend ]; then
+            echo "::error::frontend releases require use_private_module_auth=false"
+            exit 1
+          fi
+          if [ "$PRIVATE_MODULE_AUTH" = true ] && [ -z "$MODULE_TOKEN" ]; then
+            echo "::error::private module authentication requires secrets.TOKEN for BuildKit"
             exit 1
           fi
           if [ "$PUBLISH" = true ] && [ -z "$RELEASE_TAG" ]; then
@@ -237,7 +315,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: hardened-source
+          name: ${{ inputs.artifact_prefix }}-source
           path: source-security.json
 
   hardened-images:
@@ -247,6 +325,11 @@ jobs:
       packages: write
     env:
       TRIVY_PLATFORM: linux/${{ matrix.architecture }}
+      NATIVE_INVENTORY_POLICY: >-
+        (.Metadata.OS.Family // "") as $family |
+        ($family != "" and $family != "none" and $family != "unknown") and
+        (.Metadata.OS.EOSL != true) and
+        any(.Results[]?; .Class == "os-pkgs" and (.Packages | length > 0))
     strategy:
       fail-fast: false
       matrix:
@@ -254,17 +337,17 @@ jobs:
     runs-on: ${{ matrix.runner }}
     services:
       mongodb:
-        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') && 'mongo:8' || '' }}
+        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api' || inputs.hardened_profile == 'mongo-task') && 'mongo:8' || '' }}
         ports: ["27017:27017"]
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
           --health-interval 5s --health-timeout 5s --health-retries 20
       rabbitmq:
-        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') && 'rabbitmq:4-alpine' || '' }}
+        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') && (inputs.smoke_predeclare_quorum && 'rabbitmq:4-management-alpine' || 'rabbitmq:4-alpine') || '' }}
         env:
           RABBITMQ_DEFAULT_USER: ci
           RABBITMQ_DEFAULT_PASS: ${{ github.run_id }}-${{ github.run_attempt }}
-        ports: ["5672:5672"]
+        ports: ["5672:5672", "15672:15672"]
         options: >-
           --health-cmd "rabbitmq-diagnostics -q ping"
           --health-interval 5s --health-timeout 5s --health-retries 20
@@ -276,8 +359,12 @@ jobs:
       - name: Run native tests and vulnerability reachability checks
         env:
           GH_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
+          DOCKERFILE: ${{ inputs.hardened_dockerfile }}
         run: |
           args=()
+          if [ -n "$DOCKERFILE" ]; then
+            args+=(--file "$DOCKERFILE")
+          fi
           if [ -n "$GH_TOKEN" ]; then
             args+=(--secret "id=github_token,env=GH_TOKEN")
           fi
@@ -296,6 +383,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.docker_context }}
+          file: ${{ inputs.hardened_dockerfile }}
           load: true
           tags: hardened:scan
           secrets: ${{ inputs.use_private_module_auth && secrets.TOKEN != '' && format('github_token={0}', secrets.TOKEN) || '' }}
@@ -306,17 +394,57 @@ jobs:
       - name: Inspect image contract
         env:
           PROFILE: ${{ inputs.hardened_profile }}
+          EXPECTED_ENTRYPOINT: ${{ inputs.hardened_entrypoint }}
+          EXPECTED_COMMAND: ${{ inputs.hardened_command }}
+          EXPECTED_WORKDIR: ${{ inputs.hardened_workdir }}
+          BROWSER_INVENTORY: ${{ inputs.hardened_profile == 'frontend' || inputs.browser_inventory }}
         run: |
           docker image inspect hardened:scan > image-inspect.json
           test "$(docker image inspect hardened:scan --format '{{.Config.User}}')" = 65532:65532
           test "$(docker image inspect hardened:scan --format '{{.Architecture}}')" = "${{ matrix.architecture }}"
-          test "$(docker image inspect hardened:scan --format '{{json .Config.Entrypoint}}')" = '["/app/main"]'
+          test "$(docker image inspect hardened:scan --format '{{json .Config.Entrypoint}}')" = "$(jq -c . <<< "$EXPECTED_ENTRYPOINT")"
+          if [ -n "$EXPECTED_COMMAND" ]; then
+            test "$(docker image inspect hardened:scan --format '{{json .Config.Cmd}}')" = "$(jq -c . <<< "$EXPECTED_COMMAND")"
+          fi
+          if [ -n "$EXPECTED_WORKDIR" ]; then
+            test "$(docker image inspect hardened:scan --format '{{.Config.WorkingDir}}')" = "$EXPECTED_WORKDIR"
+          fi
           container=$(docker create hardened:scan)
           docker export "$container" -o rootfs.tar
           docker rm "$container"
           tar -tf rootfs.tar > rootfs-files.txt
           tar -tvf rootfs.tar > rootfs-permissions.txt
-          if [ "$PROFILE" = frontend ]; then
+          python3 - <<'PY'
+          import json
+          import os
+          import posixpath
+          import tarfile
+
+          with open("image-inspect.json") as source:
+              config = json.load(source)[0]["Config"]
+          with tarfile.open("rootfs.tar") as archive:
+              entries = {
+                  posixpath.normpath(member.name).lstrip("/"): member
+                  for member in archive.getmembers()
+              }
+          paths = {"etc", "etc/ssl", "etc/ssl/certs", "etc/ssl/certs/ca-certificates.crt"}
+          directory = posixpath.normpath(config.get("WorkingDir") or "/")
+          while directory not in ("", "/"):
+              paths.add(directory.lstrip("/"))
+              directory = posixpath.dirname(directory)
+          if os.environ["PROFILE"] == "api":
+              paths.update({"home/hub-api/keys", "home/hub-api/keys/public_key.pem"})
+          for path in sorted(paths):
+              member = entries.get(path)
+              if member is None or not (member.isdir() or member.isfile()):
+                  continue
+              shift = 6 if member.uid == 65532 else 3 if member.gid == 65532 else 0
+              permission = (1 if member.isdir() else 4) << shift
+              if not member.mode & permission:
+                  operation = "traverse" if member.isdir() else "read"
+                  raise SystemExit(f"::error::runtime UID65532 cannot {operation} /{path}")
+          PY
+          if [ "$BROWSER_INVENTORY" = true ]; then
             mkdir frontend-inventory
             tar -xOf rootfs.tar usr/share/frontend/package.json > frontend-inventory/package.json
             tar -xOf rootfs.tar usr/share/frontend/package-lock.json > frontend-inventory/package-lock.json
@@ -334,6 +462,17 @@ jobs:
             echo "::error::runtime contains a setuid or setgid executable"
             exit 1
           fi
+      - name: Prepare legacy worker quorum queue
+        if: inputs.hardened_profile == 'worker' && inputs.smoke_predeclare_quorum
+        env:
+          CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          SMOKE_QUEUE: ${{ inputs.smoke_queue }}
+        run: |
+          queue_path="$(jq -rn --arg queue "$SMOKE_QUEUE" '$queue | @uri')"
+          curl -fsS --retry 20 --retry-connrefused --retry-delay 2 --retry-max-time 60 --max-time 5 \
+            --user "ci:$CI_PASSWORD" -X PUT -H 'Content-Type: application/json' \
+            --data-binary '{"durable":true,"arguments":{"x-queue-type":"quorum"}}' \
+            "http://localhost:15672/api/queues/%2F/$queue_path"
       - name: Smoke test with a read-only filesystem and no capabilities
         if: inputs.hardened_profile == 'worker'
         env:
@@ -344,6 +483,7 @@ jobs:
             --cap-drop ALL --security-opt no-new-privileges \
             -e MONGODB_URI=mongodb://127.0.0.1:27017 \
             -e MONGODB_DATABASE_CLOUD=Kerberos \
+            -e QUEUE_SYSTEM=RABBITMQ \
             -e RABBITMQ_HOST=127.0.0.1:5672 -e RABBITMQ_EXCHANGE=ci \
             -e RABBITMQ_USERNAME=ci -e RABBITMQ_PASSWORD="$CI_PASSWORD" hardened:scan
           ready=false
@@ -369,6 +509,16 @@ jobs:
           CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
           RABBITMQ_CONTAINER: ${{ job.services.rabbitmq.id }}
         run: bash image/smoke-test.sh hardened:scan
+      - name: Smoke test repository runtime contract
+        if: inputs.hardened_profile == 'standalone' || inputs.hardened_profile == 'mongo-task' || (inputs.hardened_profile == 'worker' && inputs.worker_additional_smoke)
+        env:
+          CI_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+          SMOKE_QUEUE: ${{ inputs.smoke_queue }}
+          RABBITMQ_CONTAINER: ${{ job.services.rabbitmq.id }}
+          GH_TOKEN: ${{ inputs.use_private_module_auth && secrets.TOKEN || '' }}
+          RUNTIME_EVIDENCE_DIR: runtime-evidence
+          DOCKERFILE: ${{ inputs.hardened_dockerfile }}
+        run: bash image/smoke-test.sh hardened:scan
       - name: Scan final image
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
@@ -382,7 +532,7 @@ jobs:
           output: image-security.json
           exit-code: "0"
       - name: Scan browser dependency inventory
-        if: inputs.hardened_profile == 'frontend'
+        if: inputs.hardened_profile == 'frontend' || inputs.browser_inventory
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
           version: v0.76.1
@@ -403,7 +553,7 @@ jobs:
           format: spdx-json
           output: image.spdx.json
       - name: Generate browser dependency SPDX SBOM
-        if: inputs.hardened_profile == 'frontend'
+        if: inputs.hardened_profile == 'frontend' || inputs.browser_inventory
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         with:
           version: v0.76.1
@@ -411,15 +561,69 @@ jobs:
           scan-ref: frontend-inventory
           format: spdx-json
           output: browser.spdx.json
+      - name: Verify installed APK catalog completeness
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          test -f rootfs-files.txt
+          if database=$(grep -E '^(\./)?(usr/)?lib/apk/db/installed$' rootfs-files.txt); then
+            mkdir -p runtime-evidence
+            tar -xOf rootfs.tar "$database" > runtime-evidence/release-apk-installed
+            awk '
+              BEGIN { RS = ""; FS = "\n" }
+              {
+                package = version = ""
+                names = versions = 0
+                for (field = 1; field <= NF; field++) {
+                  if (substr($field, 1, 2) == "P:") {
+                    package = substr($field, 3)
+                    names++
+                  }
+                  if (substr($field, 1, 2) == "V:") {
+                    version = substr($field, 3)
+                    versions++
+                  }
+                }
+                if (names != 1 || versions != 1 || package == "" || version == "") {
+                  print "::error::invalid installed APK name/version record" > "/dev/stderr"
+                  exit 1
+                }
+                print package "\t" version
+              }
+            ' runtime-evidence/release-apk-installed | sort -u > runtime-evidence/release-apk-pairs.tsv
+            if [ ! -s runtime-evidence/release-apk-pairs.tsv ]; then
+              echo "::error::installed APK database contains no package name/version pairs"
+              exit 1
+            fi
+            jq -r '.Results[] | select(.Class == "os-pkgs") | .Packages[] | [.Name, .Version] | @tsv' \
+              image-security.json | sort -u > runtime-evidence/release-scanner-os-pairs.tsv
+            jq -r '.packages[] | select(any(.externalRefs[]?; .referenceType == "purl" and (.referenceLocator | startswith("pkg:apk/")))) | [.name, .versionInfo] | @tsv' \
+              image.spdx.json | sort -u > runtime-evidence/release-spdx-os-pairs.tsv
+            for catalog in scanner spdx; do
+              if ! diff -u runtime-evidence/release-apk-pairs.tsv "runtime-evidence/release-$catalog-os-pairs.tsv"; then
+                echo "::error::installed APK packages do not equal the $catalog inventory"
+                exit 1
+              fi
+            done
+          else
+            echo "No installed APK database; APK catalog equality does not apply"
+          fi
       - name: Enforce vulnerability and secret policy
         env:
-          PROFILE: ${{ inputs.hardened_profile }}
+          BROWSER_INVENTORY: ${{ inputs.hardened_profile == 'frontend' || inputs.browser_inventory }}
         run: |
+          test -f rootfs-files.txt
+          if grep -Eq '(^|/)(lib/apk/db/installed|var/lib/dpkg/status|var/lib/dpkg/status\.d(/.*)?)/?$' rootfs-files.txt; then
+            if ! jq -e "$NATIVE_INVENTORY_POLICY" image-security.json; then
+              echo "::error::runtime package database requires supported OS detection and scanned OS packages"
+              exit 1
+            fi
+          fi
           reports=(image-security.json)
-          if [ "$PROFILE" = frontend ]; then
+          if [ "$BROWSER_INVENTORY" = true ]; then
             reports+=(browser-security.json)
           fi
-          jq -se '[.[].Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' "${reports[@]}"
+          jq -se '[.[].Results[]? | ((.Vulnerabilities[]? | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")), .Secrets[]?)] | length == 0' "${reports[@]}"
       - uses: docker/login-action@v3
         if: inputs.publish
         with:
@@ -432,6 +636,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.docker_context }}
+          file: ${{ inputs.hardened_dockerfile }}
           push: true
           secrets: ${{ inputs.use_private_module_auth && secrets.TOKEN != '' && format('github_token={0}', secrets.TOKEN) || '' }}
           tags: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}-platform:staging-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}
@@ -457,18 +662,41 @@ jobs:
       - name: Gate immutable published image
         if: inputs.publish
         run: |
-          jq -e '[.Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' published-image-security.json
+          set -euo pipefail
+          export LC_ALL=C
+          test -f rootfs-files.txt
+          if grep -Eq '(^|/)(lib/apk/db/installed|var/lib/dpkg/status|var/lib/dpkg/status\.d(/.*)?)/?$' rootfs-files.txt; then
+            if ! jq -e "$NATIVE_INVENTORY_POLICY" published-image-security.json; then
+              echo "::error::published runtime package database requires supported OS detection and scanned OS packages"
+              exit 1
+            fi
+          fi
+          if grep -Eq '^(\./)?(usr/)?lib/apk/db/installed$' rootfs-files.txt; then
+            if [ ! -s runtime-evidence/release-apk-pairs.tsv ]; then
+              echo "::error::installed APK package evidence is missing"
+              exit 1
+            fi
+            jq -r '.Results[] | select(.Class == "os-pkgs") | .Packages[] | [.Name, .Version] | @tsv' \
+              published-image-security.json | sort -u > runtime-evidence/release-published-os-pairs.tsv
+            if ! diff -u runtime-evidence/release-apk-pairs.tsv runtime-evidence/release-published-os-pairs.tsv; then
+              echo "::error::published APK scan does not match the inspected installed packages"
+              exit 1
+            fi
+          fi
+          jq -e '[.Results[]? | ((.Vulnerabilities[]? | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")), .Secrets[]?)] | length == 0' published-image-security.json
       - name: Record immutable digest and base references
         if: inputs.publish
         env:
           DIGEST: ${{ steps.publish.outputs.digest }}
+          DOCKERFILE: ${{ inputs.hardened_dockerfile }}
         run: |
           printf '%s\n' "$DIGEST" > digest-${{ matrix.architecture }}.txt
-          grep '^FROM ' "$BUILD_CONTEXT/Dockerfile" > base-images.txt
+          dockerfile="${DOCKERFILE:-$BUILD_CONTEXT/Dockerfile}"
+          grep '^FROM ' "$dockerfile" > base-images.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: hardened-image-${{ matrix.architecture }}
+          name: ${{ inputs.artifact_prefix }}-image-${{ matrix.architecture }}
           path: |
             image-security.json
             browser-security.json
@@ -482,6 +710,8 @@ jobs:
             digest-*.txt
             base-images.txt
             smoke.log
+            *-smoke.log
+            runtime-evidence
 
   hardened-manifest:
     if: inputs.hardened && inputs.publish
@@ -490,7 +720,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: hardened-image-*
+          pattern: ${{ inputs.artifact_prefix }}-image-*
           merge-multiple: true
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -516,7 +746,7 @@ jobs:
           digest=$(docker buildx imagetools inspect "$staging" --format '{{json .Manifest.Digest}}' | tr -d '"')
           cosign sign --yes "$IMAGE@$digest"
           cosign verify \
-            --certificate-identity-regexp '^https://github.com/uug-ai/workflows/.github/workflows/release-create.yml@refs/.*$' \
+            --certificate-identity-regexp '^https://github\.com/uug-ai/workflows/\.github/workflows/release-create\.yml@(refs/\S+|[0-9a-f]{40})$' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$IMAGE@$digest" > signature-verification.json
           printf '%s\n' "$digest" > verified-digest.txt
@@ -548,7 +778,7 @@ jobs:
           promote "$IMAGE:latest" "$IMAGE" "$digest"
       - uses: actions/upload-artifact@v4
         with:
-          name: hardened-release
+          name: ${{ inputs.artifact_prefix }}-release
           path: |
             manifest.json
             image-digest.txt

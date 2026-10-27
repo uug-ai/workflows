@@ -137,6 +137,22 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: draft finalization must remain opt-in")
     if inputs["hardened_profile"]["default"] != "worker":
         errors.append("release-create.yml: existing hardened callers must retain the worker profile")
+    if inputs.get("artifact_prefix", {}).get("default") != "hardened":
+        errors.append("release-create.yml: existing callers must retain their artifact names")
+    if inputs.get("hardened_entrypoint", {}).get("default") != '["/app/main"]':
+        errors.append("release-create.yml: existing hardened callers must retain their entrypoint")
+    if inputs.get("hardened_command", {}).get("default") != "":
+        errors.append("release-create.yml: existing callers must not acquire a new command assertion")
+    if inputs.get("hardened_workdir", {}).get("default") != "":
+        errors.append("release-create.yml: existing callers must not acquire a new workdir assertion")
+    if inputs.get("browser_inventory", {}).get("default") is not False:
+        errors.append("release-create.yml: non-frontend browser inventory must remain opt-in")
+    if inputs.get("hardened_dockerfile", {}).get("default") != "":
+        errors.append("release-create.yml: existing callers must retain their context Dockerfile")
+    if inputs.get("worker_additional_smoke", {}).get("default") is not False:
+        errors.append("release-create.yml: additional worker smoke must remain opt-in")
+    if inputs.get("smoke_predeclare_quorum", {}).get("default") is not False:
+        errors.append("release-create.yml: worker queue provisioning must remain opt-in")
     if "id-token" in data.get("permissions", {}):
         errors.append("release-create.yml: legacy callers must not require OIDC")
 
@@ -146,16 +162,66 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
             errors.append(f"release-create.yml: {job_id} must isolate legacy builds")
     if jobs["hardened-source"]["if"] != "inputs.hardened":
         errors.append("release-create.yml: source gates must be opt-in")
+    configuration = next(
+        (step for step in jobs["hardened-source"]["steps"]
+         if step.get("name") == "Validate hardened release configuration"),
+        {},
+    )
+    if configuration.get("env", {}).get("PREDECLARE_QUORUM") != "${{ inputs.smoke_predeclare_quorum }}":
+        errors.append("release-create.yml: source validation must receive the queue fixture option")
+    if configuration.get("env", {}).get("ARTIFACT_PREFIX") != "${{ inputs.artifact_prefix }}":
+        errors.append("release-create.yml: source validation must receive the artifact prefix")
+    for job_id, suffix in (("hardened-source", "source"),
+                           ("hardened-images", "image-${{ matrix.architecture }}"),
+                           ("hardened-manifest", "release")):
+        expected = "${{ inputs.artifact_prefix }}-" + suffix
+        if not any(
+            step.get("uses", "").startswith("actions/upload-artifact@")
+            and step.get("with", {}).get("name") == expected
+            for step in jobs[job_id]["steps"]
+        ):
+            errors.append(f"release-create.yml: {job_id} artifacts require the declared namespace")
     images = jobs["hardened-images"]
     if images["needs"] != "hardened-source":
         errors.append("release-create.yml: images must require source gates")
     if images["env"].get("TRIVY_PLATFORM") != "linux/${{ matrix.architecture }}":
         errors.append("release-create.yml: registry scans must use the native platform")
+    if not images["env"].get("NATIVE_INVENTORY_POLICY"):
+        errors.append("release-create.yml: OS package inventory policy is required")
     steps = images["steps"]
+    browser_condition = "inputs.hardened_profile == 'frontend' || inputs.browser_inventory"
+    inspection = next(
+        (step for step in steps if step.get("name") == "Inspect image contract"),
+        {},
+    )
+    if (
+        inspection.get("env", {}).get("EXPECTED_ENTRYPOINT") != "${{ inputs.hardened_entrypoint }}"
+        or inspection.get("env", {}).get("EXPECTED_COMMAND") != "${{ inputs.hardened_command }}"
+        or inspection.get("env", {}).get("EXPECTED_WORKDIR") != "${{ inputs.hardened_workdir }}"
+        or inspection.get("env", {}).get("BROWSER_INVENTORY") != "${{ " + browser_condition + " }}"
+        or '$(jq -c . <<< "$EXPECTED_ENTRYPOINT")' not in inspection.get("run", "")
+        or '$(jq -c . <<< "$EXPECTED_COMMAND")' not in inspection.get("run", "")
+    ):
+        errors.append("release-create.yml: inspection must enforce the declared image entrypoint")
+    if "runtime UID65532 cannot" not in inspection.get("run", ""):
+        errors.append("release-create.yml: inspection must verify non-root access to runtime directories and trust files")
     worker_smoke = next(
         (step for step in steps if step.get("name") == "Smoke test with a read-only filesystem and no capabilities"),
         {},
     )
+    queue_fixture = next(
+        (step for step in steps if step.get("name") == "Prepare legacy worker quorum queue"),
+        {},
+    )
+    if (
+        queue_fixture.get("if") != "inputs.hardened_profile == 'worker' && inputs.smoke_predeclare_quorum"
+        or queue_fixture.get("env", {}).get("SMOKE_QUEUE") != "${{ inputs.smoke_queue }}"
+        or queue_fixture.get("env", {}).get("CI_PASSWORD") != images["services"]["rabbitmq"]["env"]["RABBITMQ_DEFAULT_PASS"]
+        or "15672:15672" not in images["services"]["rabbitmq"].get("ports", [])
+        or "'$queue | @uri'" not in queue_fixture.get("run", "")
+        or '"x-queue-type":"quorum"' not in queue_fixture.get("run", "")
+    ):
+        errors.append("release-create.yml: legacy queue fixtures must be explicit, encoded quorum declarations")
     frontend_smoke = next(
         (step for step in steps if step.get("name") == "Smoke test frontend routing and runtime configuration"),
         {},
@@ -164,8 +230,22 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         (step for step in steps if step.get("name") == "Smoke test API HTTP and database readiness"),
         {},
     )
+    repository_smoke = next(
+        (step for step in steps if step.get("name") == "Smoke test repository runtime contract"),
+        {},
+    )
+    if (
+        repository_smoke.get("if") != (
+            "inputs.hardened_profile == 'standalone' || inputs.hardened_profile == 'mongo-task' || "
+            "(inputs.hardened_profile == 'worker' && inputs.worker_additional_smoke)"
+        )
+        or repository_smoke.get("run") != "bash image/smoke-test.sh hardened:scan"
+    ):
+        errors.append("release-create.yml: standalone/native runtime contracts require repository image smoke")
     if worker_smoke.get("if") != "inputs.hardened_profile == 'worker'":
         errors.append("release-create.yml: worker smoke checks must be profile-specific")
+    if "-e QUEUE_SYSTEM=RABBITMQ" not in worker_smoke.get("run", ""):
+        errors.append("release-create.yml: worker smoke checks must select RabbitMQ explicitly")
     if frontend_smoke.get("if") != "inputs.hardened_profile == 'frontend'":
         errors.append("release-create.yml: frontend routing/configuration smoke checks are required")
     if frontend_smoke.get("run") != "bash image/smoke-test.sh hardened:scan":
@@ -177,12 +257,15 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     ):
         errors.append("release-create.yml: API HTTP/database/queue checks must exercise the built image")
     for service, image in (("mongodb", "mongo:8"), ("rabbitmq", "rabbitmq:4-alpine")):
-        expected = (
-            "${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api') "
-            f"&& '{image}' || '' }}}}"
-        )
+        profiles = "inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api'"
+        if service == "mongodb":
+            profiles += " || inputs.hardened_profile == 'mongo-task'"
+        selected_image = f"'{image}'"
+        if service == "rabbitmq":
+            selected_image = "(inputs.smoke_predeclare_quorum && 'rabbitmq:4-management-alpine' || 'rabbitmq:4-alpine')"
+        expected = "${{ (" + profiles + ") && " + selected_image + " || '' }}"
         if images["services"][service]["image"] != expected:
-            errors.append(f"release-create.yml: {service} must run for worker/API profiles only")
+            errors.append(f"release-create.yml: {service} must match the profile dependencies")
     native_tests = next(
         (step for step in steps if step.get("name") == "Run native tests and vulnerability reachability checks"),
         {},
@@ -192,24 +275,60 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         or '--secret "id=github_token,env=GH_TOKEN"' not in native_tests.get("run", "")
     ):
         errors.append("release-create.yml: native tests require scoped BuildKit module secrets")
+    if (
+        native_tests.get("env", {}).get("DOCKERFILE") != "${{ inputs.hardened_dockerfile }}"
+        or 'args+=(--file "$DOCKERFILE")' not in native_tests.get("run", "")
+    ):
+        errors.append("release-create.yml: native tests must use the selected Dockerfile")
     browser_scan = next(
         (step for step in steps if step.get("name") == "Scan browser dependency inventory"),
         {},
     )
     if (
-        browser_scan.get("if") != "inputs.hardened_profile == 'frontend'"
+        browser_scan.get("if") != browser_condition
         or browser_scan.get("with", {}).get("scan-ref") != "frontend-inventory"
         or browser_scan.get("with", {}).get("scan-type") != "fs"
     ):
         errors.append("release-create.yml: browser lock inventory extracted from the image must be scanned")
+    browser_sbom = next(
+        (step for step in steps if step.get("name") == "Generate browser dependency SPDX SBOM"),
+        {},
+    )
+    image_policy = next(
+        (step for step in steps if step.get("name") == "Enforce vulnerability and secret policy"),
+        {},
+    )
+    if (
+        browser_sbom.get("if") != browser_condition
+        or image_policy.get("env", {}).get("BROWSER_INVENTORY") != "${{ " + browser_condition + " }}"
+    ):
+        errors.append("release-create.yml: all browser inventory profiles require SBOM and policy gates")
+    for step in steps:
+        if step.get("name") in ("Enforce vulnerability and secret policy", "Gate immutable published image"):
+            if '"$NATIVE_INVENTORY_POLICY"' not in step.get("run", ""):
+                errors.append("release-create.yml: local and published package inventories must be scanned")
+    apk_catalog = next(
+        (step for step in steps if step.get("name") == "Verify installed APK catalog completeness"),
+        {},
+    )
+    if apk_catalog.get("if") or any(
+        evidence not in apk_catalog.get("run", "")
+        for evidence in ("rootfs.tar", "image-security.json", "image.spdx.json",
+                         "runtime-evidence/release-apk-pairs.tsv", "diff -u")
+    ):
+        errors.append("release-create.yml: installed APK catalogs require an unconditional exact-set gate")
     names = [step.get("name") for step in steps]
     required_order = [
         "Run native tests and vulnerability reachability checks",
         "Inspect image contract",
+        "Prepare legacy worker quorum queue",
         "Smoke test with a read-only filesystem and no capabilities",
         "Smoke test frontend routing and runtime configuration",
         "Smoke test API HTTP and database readiness",
+        "Smoke test repository runtime contract",
         "Scan browser dependency inventory",
+        "Generate SPDX SBOM",
+        "Verify installed APK catalog completeness",
         "Enforce vulnerability and secret policy",
         "Publish staged image with provenance and SBOM",
         "Scan immutable published image",
@@ -228,8 +347,15 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
             options = step.get("with", {})
             if options.get("secrets") != BUILD_MODULE_SECRET:
                 errors.append(f"release-create.yml: {name} must supply optional private modules via BuildKit secrets")
+            if options.get("file") != "${{ inputs.hardened_dockerfile }}":
+                errors.append(f"release-create.yml: {name} must use the tested Dockerfile")
             if re.search(r"github_(?:username|token)", options.get("build-args", "")):
                 errors.append(f"release-create.yml: {name} must not use credential build arguments")
+        if name == "Record immutable digest and base references" and (
+            step.get("env", {}).get("DOCKERFILE") != "${{ inputs.hardened_dockerfile }}"
+            or '${DOCKERFILE:-$BUILD_CONTEXT/Dockerfile}' not in step.get("run", "")
+        ):
+            errors.append("release-create.yml: base evidence must use the published Dockerfile")
         if name == "Publish staged image with provenance and SBOM":
             if step["with"].get("provenance") != "mode=max" or step["with"].get("sbom") is not True:
                 errors.append("release-create.yml: publishing requires provenance and SBOM")
@@ -252,6 +378,12 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     if "id-token" in manifest.get("permissions", {}):
         errors.append("release-create.yml: signing must inherit the caller's optional OIDC grant")
     manifest_steps = manifest["steps"]
+    if not any(
+        step.get("uses", "").startswith("actions/download-artifact@")
+        and step.get("with", {}).get("pattern") == "${{ inputs.artifact_prefix }}-image-*"
+        for step in manifest_steps
+    ):
+        errors.append("release-create.yml: manifest assembly must isolate its image artifacts")
     manifest_names = [step.get("name") for step in manifest_steps]
     required_manifest_order = [
         "Assemble and verify staged multi-platform manifest",

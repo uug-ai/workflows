@@ -180,7 +180,9 @@ This profile expects a Dockerfile `test` stage running native tests and
 source/binary reachability checks, an image running as `65532:65532` with
 entrypoint `/app/main`, and a MongoDB/RabbitMQ worker exposing `/metrics` on
 port 8080. Builds, read-only/no-capability smoke tests, source secret/config
-checks, and medium/high/critical image gates precede publishing. Native registry
+checks, and medium/high/critical image gates precede publishing. Every detected
+image or browser secret blocks publication, even with LOW, UNKNOWN or missing
+severity; LOW/UNKNOWN vulnerabilities remain visible but nonblocking. Native registry
 rescans use the explicit platform. SBOMs, maximum provenance and verified
 keyless signatures precede GitOps promotion. All evidence remains in Actions
 artifacts; signing identities use
@@ -247,8 +249,104 @@ For pull-request or push validation, set
 `publish: false` and leave `create_gitops_pr: false`; neither manifests,
 signatures, registry writes nor deployment proposals are produced. A manual
 caller can pass an existing release tag to retry publication without a new
-version or moving the source tag. Hardened builds currently support public
-modules only and never accept credential build arguments.
+version or moving the source tag. Hardened builds never accept credential build
+arguments. Worker/API callers with private dependencies may opt into
+`use_private_module_auth: true`; `secrets.TOKEN` is then required and is passed
+only as a BuildKit secret. Public-module workers should continue to set it false.
+
+The expected image entrypoint defaults to `["/app/main"]`. To retain an existing
+executable path, set `hardened_entrypoint` to its JSON array, for example
+`'["./hub-pipeline-counting"]'`. Inspection must match that exact array; the
+numeric identity, runtime file gates, smoke tests and scan gates still apply.
+For a CMD-only image, set `hardened_entrypoint: 'null'` and an explicit
+`hardened_command`, for example `'["./main"]'`. Both actual metadata fields are
+then checked independently; they are not conflated into a combined argument
+array. Null/empty entrypoints without a non-empty command are rejected.
+Set `hardened_workdir` to assert a required absolute working directory without
+changing existing callers' defaults.
+
+Go binaries may use `-ldflags="-w -buildid="` to omit DWARF debug information
+while retaining Go symbols and build/module information for vulnerability
+analysis. Do not add `-s` or run a stripping tool. Both source and actual-binary
+`govulncheck` remain required after applying these flags.
+
+### Additional runtime contracts
+
+When one caller workflow builds multiple images, give each reusable call a
+distinct `artifact_prefix`, such as `assistant_api` and `assistant_worker`.
+Prefixes may contain only letters, digits and underscores; the default
+`hardened` retains existing artifact names. Source, native-image and signed
+release evidence are all namespaced, and each manifest downloads only its own
+native digests. The restricted alphabet prevents overlapping wildcard prefixes.
+This isolates artifacts, not release completion: keep `finalize_release: false`
+on each image call and finalize the draft only after every required image has
+successfully completed verification and publication.
+
+Signature verification accepts the owned reusable workflow's `refs/...`
+identity or its full 40-character commit pin. It does not trust another
+repository or workflow path. Consumer verification must use the exact
+certificate identity corresponding to its chosen reusable-workflow reference.
+
+Use `hardened_profile: standalone` for CLI, scheduler or HTTP images whose
+repository smoke needs no shared databases or queues. Use `mongo-task` when the
+smoke requires only the isolated MongoDB service (for example retention
+cleanup). Both profiles must provide `image/smoke-test.sh hardened:scan`; it
+must exercise the actual image with read-only root, dropped capabilities,
+no-new-privileges and only explicitly required writable paths. Never point smoke
+at production resources or send real notifications. Missing/failed smoke blocks
+scans and publication; the common identity, file, vulnerability, secret, SBOM,
+provenance, signing and promotion gates remain mandatory.
+
+An application such as Vault that also ships browser assets must set
+`browser_inventory: true` and include its inventory at the same
+`/usr/share/frontend/package.json` and `package-lock.json` paths as the frontend.
+Extraction, scanning, policy enforcement and browser SPDX generation then apply
+regardless of runtime profile; frontend always requires them.
+
+For native media workers, `worker_additional_smoke: true` requires that same
+repository script **after** the existing queue readiness check. This is not a
+replacement for queue checks: use it to verify the actual image's FFmpeg/OpenCV
+or other native resources with a small local fixture. It is rejected for other
+profiles rather than silently ignored.
+Legacy workers that consume an already-provisioned durable quorum queue can set
+`smoke_predeclare_quorum: true`. Only this opt-in enables the isolated RabbitMQ
+management fixture and declares `smoke_queue` before worker startup. Declaration
+failures block validation; queue names are URL-encoded and readiness still
+requires the actual worker consumer. Existing callers retain their queue
+bootstrap behavior. This option is rejected for non-worker profiles.
+
+Image inspection also checks that UID/GID 65532 can search the working-directory
+ancestors and CA directories and read the trust bundle (plus the API license
+public key). `COPY --chmod=0444` of a single file can create unsearchable parent
+directories. Prepare a root-owned tree with 0755 directories and 0444 public
+files in the builder, then copy that tree without a recursive chmod. A passing
+host-IP service smoke alone does not establish working DNS or TLS.
+When the image contains an APK or dpkg package database, both local and
+immutable-published scans must detect a supported OS and enumerate OS packages.
+For APK runtimes, the installed name/version set extracted from the inspected
+root filesystem must exactly equal both the OS scan and native SPDX package
+sets before staging publication. The immutable-published OS scan must match
+that installed set as well; empty, missing, extra or version-mismatched
+inventories fail closed. These comparisons and the raw APK database are
+retained in `runtime-evidence/release-*`. This does not inventory statically
+bundled native archives or establish equivalent dpkg set coverage.
+An unsupported/EOL OS or a Go-only result cannot certify copied native
+libraries. Retain the matching distribution identity and package metadata;
+repository-native inventory checks must additionally cover the actual copied
+components.
+
+Repository smoke receives `RUNTIME_EVIDENCE_DIR=runtime-evidence`; use it for
+native test reports. The workflow retains that directory and `*-smoke.log` files
+alongside the common evidence. Private native-test builds must use the provided
+`GH_TOKEN` environment value only through a BuildKit secret, never command-line
+credentials.
+
+Set `hardened_dockerfile` only when validating a non-default Dockerfile. The
+native test target, inspection image and published image all use that same
+file; an empty value preserves the Dockerfile selected by the build context.
+Each selected Dockerfile must expose the `test` target. Different variants
+still need distinct consumer jobs/publication destinations to avoid image and
+artifact collisions; this input does not invent new release variants.
 
 ### Hardened frontend releases
 
@@ -262,7 +360,7 @@ configuration, SPA routing, cache policies and missing static files. Both
 profiles retain the numeric `/app/main` contract, native `test` build stage,
 source/image scans, immutable rescans, SBOM/provenance, staged promotion,
 signing and optional draft finalization. `smoke_queue` is required only for the
-worker profile; both profiles require `use_private_module_auth: false`.
+worker profile; frontend requires `use_private_module_auth: false`.
 The frontend exports `/usr/share/frontend/package.json` and `package-lock.json`
 from the inspected image to `frontend-inventory`, then scans it explicitly in
 filesystem mode and emits a browser SPDX report. An OS/library image scan alone
@@ -277,7 +375,8 @@ access to its private Go dependencies. Native test, inspection and publication
 builds pass it only as the BuildKit secret `github_token`, never a credential
 build argument. The API Dockerfile requires that secret, scopes Git credential
 lookup to GitHub and must not persist a token-bearing Git configuration.
-Worker/frontend callers retain their existing no-authentication requirements.
+Frontend retains its no-authentication requirement. Workers may use the same
+secret-based opt-in when their dependency graph includes private modules.
 
 The API profile starts MongoDB and RabbitMQ, retains the common `/app/main`,
 numeric non-root identity, scans/SBOM/provenance/signing/promotion contracts,
