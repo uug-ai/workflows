@@ -304,6 +304,12 @@ public key). `COPY --chmod=0444` of a single file can create unsearchable parent
 directories. Prepare a root-owned tree with 0755 directories and 0444 public
 files in the builder, then copy that tree without a recursive chmod. A passing
 host-IP service smoke alone does not establish working DNS or TLS.
+When the image contains an APK or dpkg package database, both local and
+immutable-published scans must detect a supported OS and enumerate OS packages.
+An unsupported/EOL OS or a Go-only result cannot certify copied native
+libraries. Retain the matching distribution identity and package metadata;
+repository-native inventory checks must additionally cover the actual copied
+components.
 
 Repository smoke receives `RUNTIME_EVIDENCE_DIR=runtime-evidence`; use it for
 native test reports. The workflow retains that directory and `*-smoke.log` files

@@ -542,7 +542,7 @@ esac
         self.bump_script = bump["jobs"]["bump-release"]["steps"][-1]["run"]
 
     def execute(self, scripts, fail_at="", draft_state="true", draft="true", report=None,
-                profile="worker", browser_report=None, browser_inventory=False):
+                profile="worker", browser_report=None, browser_inventory=False, rootfs_files=""):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for command in ("docker", "cosign", "gh", "git"):
@@ -556,6 +556,8 @@ esac
                 (root / "image-security.json").write_text(json.dumps(report))
             if browser_report is not None:
                 (root / "browser-security.json").write_text(json.dumps(browser_report))
+            if rootfs_files is not None:
+                (root / "rootfs-files.txt").write_text(rootfs_files)
             env = dict(
                 os.environ,
                 PATH=f"{root}{os.pathsep}{os.environ['PATH']}",
@@ -566,6 +568,8 @@ esac
                 DRAFT=draft,
                 PROFILE=profile,
                 BROWSER_INVENTORY="true" if profile == "frontend" or browser_inventory else "false",
+                NATIVE_INVENTORY_POLICY=load_yaml(WORKFLOWS_DIR / "release-create.yml")[
+                    "jobs"]["hardened-images"]["env"]["NATIVE_INVENTORY_POLICY"],
                 IMAGE="ghcr.io/uug-ai/example",
                 PLATFORM_IMAGE="ghcr.io/uug-ai/example-platform",
                 TAG="v1.2.3",
@@ -582,6 +586,35 @@ esac
             event_log = root / "events"
             events = event_log.read_text().splitlines() if event_log.exists() else []
             return result, events, (root / "verified-digest.txt").exists()
+
+    def test_native_package_databases_require_supported_scanned_os_inventory(self):
+        for gate in (self.image_gate, self.registry_gate):
+            for database in ("var/lib/dpkg/status", "var/lib/dpkg/status.d/libc6",
+                             "lib/apk/db/installed"):
+                for family, eosl, packages, expected in (
+                    ("debian", False, [{"Name": "libc6"}], 0),
+                    ("wolfi", False, [{"Name": "glibc"}], 0),
+                    ("none", False, [{"Name": "libc6"}], 1),
+                    ("", False, [{"Name": "libc6"}], 1),
+                    ("debian", True, [{"Name": "libc6"}], 1),
+                    ("debian", False, [], 1),
+                ):
+                    with self.subTest(database=database, family=family, eosl=eosl,
+                                      packages=packages, gate=gate[:30]):
+                        report = {
+                            "Metadata": {"OS": {"Family": family, "EOSL": eosl}},
+                            "Results": [{"Class": "os-pkgs", "Packages": packages}],
+                        }
+                        result, _, _ = self.execute(
+                            [gate], report=report, rootfs_files=database + "\n",
+                        )
+                        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_missing_rootfs_inventory_cannot_bypass_os_package_checks(self):
+        for gate in (self.image_gate, self.registry_gate):
+            with self.subTest(gate=gate[:30]):
+                result, _, _ = self.execute([gate], report={"Results": []}, rootfs_files=None)
+                self.assertNotEqual(result.returncode, 0)
 
     def manifest_scripts(self):
         return [step["run"] for step in self.steps if "run" in step]

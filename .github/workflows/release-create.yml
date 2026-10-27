@@ -316,6 +316,11 @@ jobs:
       packages: write
     env:
       TRIVY_PLATFORM: linux/${{ matrix.architecture }}
+      NATIVE_INVENTORY_POLICY: >-
+        (.Metadata.OS.Family // "") as $family |
+        ($family != "" and $family != "none" and $family != "unknown") and
+        (.Metadata.OS.EOSL != true) and
+        any(.Results[]?; .Class == "os-pkgs" and (.Packages | length > 0))
     strategy:
       fail-fast: false
       matrix:
@@ -551,6 +556,13 @@ jobs:
         env:
           BROWSER_INVENTORY: ${{ inputs.hardened_profile == 'frontend' || inputs.browser_inventory }}
         run: |
+          test -f rootfs-files.txt
+          if grep -Eq '(^|/)(lib/apk/db/installed|var/lib/dpkg/status|var/lib/dpkg/status\.d(/.*)?)/?$' rootfs-files.txt; then
+            if ! jq -e "$NATIVE_INVENTORY_POLICY" image-security.json; then
+              echo "::error::runtime package database requires supported OS detection and scanned OS packages"
+              exit 1
+            fi
+          fi
           reports=(image-security.json)
           if [ "$BROWSER_INVENTORY" = true ]; then
             reports+=(browser-security.json)
@@ -594,6 +606,13 @@ jobs:
       - name: Gate immutable published image
         if: inputs.publish
         run: |
+          test -f rootfs-files.txt
+          if grep -Eq '(^|/)(lib/apk/db/installed|var/lib/dpkg/status|var/lib/dpkg/status\.d(/.*)?)/?$' rootfs-files.txt; then
+            if ! jq -e "$NATIVE_INVENTORY_POLICY" published-image-security.json; then
+              echo "::error::published runtime package database requires supported OS detection and scanned OS packages"
+              exit 1
+            fi
+          fi
           jq -e '[.Results[]? | (.Vulnerabilities[]?, .Secrets[]?) | select(.Severity == "MEDIUM" or .Severity == "HIGH" or .Severity == "CRITICAL")] | length == 0' published-image-security.json
       - name: Record immutable digest and base references
         if: inputs.publish

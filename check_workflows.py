@@ -172,6 +172,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: images must require source gates")
     if images["env"].get("TRIVY_PLATFORM") != "linux/${{ matrix.architecture }}":
         errors.append("release-create.yml: registry scans must use the native platform")
+    if not images["env"].get("NATIVE_INVENTORY_POLICY"):
+        errors.append("release-create.yml: OS package inventory policy is required")
     steps = images["steps"]
     browser_condition = "inputs.hardened_profile == 'frontend' || inputs.browser_inventory"
     inspection = next(
@@ -287,6 +289,10 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         or image_policy.get("env", {}).get("BROWSER_INVENTORY") != "${{ " + browser_condition + " }}"
     ):
         errors.append("release-create.yml: all browser inventory profiles require SBOM and policy gates")
+    for step in steps:
+        if step.get("name") in ("Enforce vulnerability and secret policy", "Gate immutable published image"):
+            if '"$NATIVE_INVENTORY_POLICY"' not in step.get("run", ""):
+                errors.append("release-create.yml: local and published package inventories must be scanned")
     names = [step.get("name") for step in steps]
     required_order = [
         "Run native tests and vulnerability reachability checks",
