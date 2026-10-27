@@ -570,14 +570,25 @@ jobs:
             mkdir -p runtime-evidence
             tar -xOf rootfs.tar "$database" > runtime-evidence/release-apk-installed
             awk '
-              /^$/ { package = "" }
-              /^P:/ { package = substr($0, 3) }
-              /^V:/ {
-                if (package == "" || length($0) <= 2) {
+              BEGIN { RS = ""; FS = "\n" }
+              {
+                package = version = ""
+                names = versions = 0
+                for (field = 1; field <= NF; field++) {
+                  if (substr($field, 1, 2) == "P:") {
+                    package = substr($field, 3)
+                    names++
+                  }
+                  if (substr($field, 1, 2) == "V:") {
+                    version = substr($field, 3)
+                    versions++
+                  }
+                }
+                if (names != 1 || versions != 1 || package == "" || version == "") {
                   print "::error::invalid installed APK name/version record" > "/dev/stderr"
                   exit 1
                 }
-                print package "\t" substr($0, 3)
+                print package "\t" version
               }
             ' runtime-evidence/release-apk-installed | sort -u > runtime-evidence/release-apk-pairs.tsv
             if [ ! -s runtime-evidence/release-apk-pairs.tsv ]; then

@@ -725,8 +725,12 @@ esac
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_missing_empty_and_malformed_apk_database_fail(self):
-        _, report, spdx = self.apk_fixture()
-        for database in (None, "", "P:glibc\nV:\n", "V:2.42-r2\n"):
+        valid_database, report, spdx = self.apk_fixture()
+        for database in (
+            None, "", "P:glibc\nV:\n", "V:2.42-r2\n",
+            valid_database + "P:omitted-version\n",
+            valid_database.replace("\n\n", "\n"),
+        ):
             with self.subTest(database=database):
                 result, _, _ = self.execute(
                     [self.apk_gate], report=report, spdx_report=spdx,
