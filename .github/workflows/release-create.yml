@@ -62,6 +62,10 @@ on:
         description: 'Provision a durable quorum queue for workers that require an existing queue'
         type: boolean
         default: false
+      smoke_mongodb_image:
+        description: 'MongoDB service image for worker, API and mongo-task smoke tests'
+        type: string
+        default: 'mongo:8'
       publish:
         description: 'Publish verified images; false runs hardened validation only'
         type: boolean
@@ -337,7 +341,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     services:
       mongodb:
-        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api' || inputs.hardened_profile == 'mongo-task') && 'mongo:8' || '' }}
+        image: ${{ (inputs.hardened_profile == 'worker' || inputs.hardened_profile == 'api' || inputs.hardened_profile == 'mongo-task') && inputs.smoke_mongodb_image || '' }}
         ports: ["27017:27017"]
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
