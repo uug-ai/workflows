@@ -156,6 +156,13 @@ jobs:
 
 Set `create_gitops_pr: false` if you only want to publish images and manifests without opening a GitOps pull request.
 
+Hardened `worker`, `api` and `mongo-task` profiles use `mongo:8` for their
+isolated smoke-test service by default. Callers may set `smoke_mongodb_image`
+to another compatible image, for example `mongo:7` when MongoDB 8 cannot start
+on the runner's kernel. This changes only the test fixture, not the released
+application or its production database configuration. MongoDB health checks
+and all smoke/security gates remain enabled.
+
 `release-create.yml` builds one image per entry in `runner_matrix` and then creates the published manifests from the `architecture` values in that matrix, so the manifest contents stay aligned with the configured build targets.
 
 The caller must grant `packages: write`. A reusable workflow can narrow the

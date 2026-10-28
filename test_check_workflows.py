@@ -67,11 +67,20 @@ class ReleaseContractsTest(unittest.TestCase):
                             ("hardened_dockerfile", "Dockerfile.cv"),
                             ("worker_additional_smoke", True),
                             ("smoke_predeclare_quorum", True),
+                            ("smoke_mongodb_image", "mongo:7"),
                             ("artifact_prefix", "other")):
             with self.subTest(name=name):
                 workflow = copy.deepcopy(self.workflow)
                 workflow["on"]["workflow_call"]["inputs"][name]["default"] = value
                 self.assertTrue(self.errors(workflow))
+
+    def test_mongodb_smoke_image_must_use_the_caller_input(self):
+        self.workflow["jobs"]["hardened-images"]["services"]["mongodb"]["image"] = (
+            "${{ (inputs.hardened_profile == 'worker' || "
+            "inputs.hardened_profile == 'api' || "
+            "inputs.hardened_profile == 'mongo-task') && 'mongo:8' || '' }}"
+        )
+        self.assertTrue(self.errors(self.workflow))
 
     def test_artifact_namespaces_cover_all_uploads_and_manifest_downloads(self):
         for job_id in ("hardened-source", "hardened-images", "hardened-manifest"):

@@ -153,6 +153,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: additional worker smoke must remain opt-in")
     if inputs.get("smoke_predeclare_quorum", {}).get("default") is not False:
         errors.append("release-create.yml: worker queue provisioning must remain opt-in")
+    if inputs.get("smoke_mongodb_image", {}).get("default") != "mongo:8":
+        errors.append("release-create.yml: existing callers must retain their MongoDB smoke image")
     if "id-token" in data.get("permissions", {}):
         errors.append("release-create.yml: legacy callers must not require OIDC")
 
@@ -261,6 +263,8 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         if service == "mongodb":
             profiles += " || inputs.hardened_profile == 'mongo-task'"
         selected_image = f"'{image}'"
+        if service == "mongodb":
+            selected_image = "inputs.smoke_mongodb_image"
         if service == "rabbitmq":
             selected_image = "(inputs.smoke_predeclare_quorum && 'rabbitmq:4-management-alpine' || 'rabbitmq:4-alpine')"
         expected = "${{ (" + profiles + ") && " + selected_image + " || '' }}"
