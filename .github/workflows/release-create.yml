@@ -67,11 +67,11 @@ on:
         type: string
         default: 'mongo:8'
       publish:
-        description: 'Publish verified images; false runs hardened validation only'
+        description: 'Publish images; false builds without publishing and runs verification when hardened'
         type: boolean
         default: true
       finalize_release:
-        description: 'Publish an existing draft GitHub release after hardened image promotion succeeds'
+        description: 'Record image hardening status and publish an existing draft after image publication succeeds'
         type: boolean
         default: false
       smoke_queue:
@@ -83,6 +83,10 @@ on:
         required: false
         type: boolean
         default: true
+      use_buildkit_secrets:
+        description: 'Pass private module credentials as github_token BuildKit secret instead of credential build arguments'
+        type: boolean
+        default: false
       runner_matrix:
         description: 'JSON array of objects with architecture and runner keys'
         required: false
@@ -157,7 +161,7 @@ env:
 jobs:
 
   build:
-    if: ${{ !inputs.hardened && inputs.publish }}
+    if: ${{ !inputs.hardened }}
     permissions:
       contents: read
       packages: write
@@ -168,7 +172,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+      - name: Release metadata
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          {
+            echo "version=${RELEASE_TAG:-dev}"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "created=$(git show -s --format=%cI HEAD)"
+          } >> "$GITHUB_OUTPUT"
       - name: Log in to GitHub Container Registry
+        if: inputs.publish
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -178,16 +195,40 @@ jobs:
         if: ${{ !inputs.use_private_module_auth }}
         run: |
           docker build --provenance=false -t "${{ matrix.architecture }}" \
+          --build-arg "VERSION=${{ steps.metadata.outputs.version }}" \
+          --build-arg "REVISION=${{ steps.metadata.outputs.revision }}" \
+          --build-arg "CREATED=${{ steps.metadata.outputs.created }}" \
           --build-arg "project=${{ env.PROJECT }}" "${{ env.BUILD_CONTEXT }}"
       - name: Run private dependency build
-        if: ${{ inputs.use_private_module_auth }}
+        if: ${{ inputs.use_private_module_auth && !inputs.use_buildkit_secrets }}
         run: |
           docker build --provenance=false -t "${{ matrix.architecture }}" \
+          --build-arg "VERSION=${{ steps.metadata.outputs.version }}" \
+          --build-arg "REVISION=${{ steps.metadata.outputs.revision }}" \
+          --build-arg "CREATED=${{ steps.metadata.outputs.created }}" \
           --build-arg "project=${{ env.PROJECT }}" \
           --build-arg "github_username=${{ secrets.USERNAME }}" \
           --build-arg "github_token=${{ secrets.TOKEN }}" "${{ env.BUILD_CONTEXT }}"
 
+      - name: Run private dependency build with BuildKit secret
+        if: ${{ inputs.use_private_module_auth && inputs.use_buildkit_secrets }}
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Private module builds require the TOKEN secret"
+            exit 1
+          fi
+          docker build --provenance=false -t "${{ matrix.architecture }}" \
+            --secret "id=github_token,env=GH_TOKEN" \
+            --build-arg "VERSION=${{ steps.metadata.outputs.version }}" \
+            --build-arg "REVISION=${{ steps.metadata.outputs.revision }}" \
+            --build-arg "CREATED=${{ steps.metadata.outputs.created }}" \
+            --build-arg "project=${{ env.PROJECT }}" "${{ env.BUILD_CONTEXT }}"
+
       - name: Build and push Docker image
+        if: inputs.publish
         run: |
           docker tag "${{ matrix.architecture }}" "ghcr.io/$ORGANIZATION/$PROJECT-platform:${{ matrix.architecture }}-${{ env.TAG }}"
           docker push "ghcr.io/$ORGANIZATION/$PROJECT-platform:${{ matrix.architecture }}-${{ env.TAG }}"
@@ -787,16 +828,23 @@ jobs:
             manifest.json
             image-digest.txt
             signature-verification.json
-      - name: Finalize verified GitHub release
-        if: inputs.finalize_release
+  finalize-release:
+    needs: [create-manifest, hardened-manifest]
+    if: ${{ always() && !cancelled() && inputs.finalize_release && inputs.publish && (needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Record hardening status and finalize GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          HARDENED: ${{ inputs.hardened }}
         run: |
           set -euo pipefail
-          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body,isDraft > release.json
+          draft=$(jq -r '.isDraft' release.json)
+          args=()
           case "$draft" in
             true)
-              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --verify-tag
+              args+=(--draft=false --verify-tag)
               ;;
             false)
               echo "Release $TAG is already published; preserving its publication state."
@@ -806,14 +854,29 @@ jobs:
               exit 1
               ;;
           esac
+          case "$HARDENED" in
+            true) status='Verified (security checks, SBOM, provenance and signing)' ;;
+            false) status='Not verified (standard build)' ;;
+            *)
+              echo "::error::Unexpected image hardening state: $HARDENED"
+              exit 1
+              ;;
+          esac
+          jq -j --arg status "$status" '
+            (.body // "" | sub("\\A<!-- image-hardening:start -->.*?<!-- image-hardening:end -->\\n*"; ""; "m")) as $body
+            | "<!-- image-hardening:start -->\n**Image hardening: " + $status
+              + "**\n<!-- image-hardening:end -->\n\n" + $body
+          ' release.json > release-notes.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --notes-file release-notes.md "${args[@]}"
 
   update-gitops:
     permissions:
       contents: read
       packages: write
     runs-on: ubuntu-24.04
-    needs: [create-manifest, hardened-manifest]
-    if: ${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && (needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}
+    needs: [create-manifest, hardened-manifest, finalize-release]
+    if: ${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && (needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') && (needs.finalize-release.result == 'success' || needs.finalize-release.result == 'skipped') }}
     steps:
       # After we build the Docker image, we create a pull request to update the GitOps repository
       # This will allow us to update the Helm chart with the new Docker image tag.

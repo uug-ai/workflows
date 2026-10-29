@@ -44,3 +44,6 @@ jobs:
     uses: ./.github/workflows/release-create.yml
     with:
       publish: false
+      use_private_module_auth: false
+      docker_context: .github/fixtures/release
+      runner_matrix: '[{"architecture":"amd64","runner":"ubuntu-24.04"}]'
