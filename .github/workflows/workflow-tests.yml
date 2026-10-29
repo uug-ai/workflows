@@ -38,11 +38,12 @@ jobs:
         run: python -m unittest discover -s .github/actions/pr-description -p 'test_*.py'
 
   legacy-release-permissions:
-    # Check caller permissions without building this workflow-only repository.
-    if: ${{ false }}
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/release-create.yml
     with:
       publish: false
+      use_private_module_auth: false
+      docker_context: .github/fixtures/release
+      runner_matrix: '[{"architecture":"amd64","runner":"ubuntu-24.04"}]'

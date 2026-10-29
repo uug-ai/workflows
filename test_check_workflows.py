@@ -503,6 +503,19 @@ class ReleaseContractsTest(unittest.TestCase):
         self.workflow["jobs"]["build"]["if"] = "${{ !inputs.hardened && inputs.publish }}"
         self.assertTrue(self.errors(self.workflow))
 
+    def test_standard_dry_run_smoke_uses_read_only_caller_without_oidc_or_secrets(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "workflow-tests.yml")
+        smoke = workflow["jobs"]["legacy-release-permissions"]
+        self.assertNotIn("if", smoke)
+        self.assertEqual(smoke["permissions"], {"contents": "read", "packages": "write"})
+        self.assertIs(smoke["with"]["publish"], False)
+        self.assertIs(smoke["with"]["use_private_module_auth"], False)
+        context = WORKFLOWS_DIR.parent.parent / smoke["with"]["docker_context"]
+        self.assertTrue((context / "Dockerfile").is_file())
+        self.assertEqual(json.loads(smoke["with"]["runner_matrix"]), [
+            {"architecture": "amd64", "runner": "ubuntu-24.04"},
+        ])
+
     def test_standard_validation_cannot_log_in_or_push(self):
         for name in ("Log in to GitHub Container Registry", "Build and push Docker image"):
             with self.subTest(name=name):
