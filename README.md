@@ -156,6 +156,17 @@ jobs:
 
 Set `create_gitops_pr: false` if you only want to publish images and manifests without opening a GitOps pull request.
 
+When `create_gitops_pr: true`, the workflow copies the source repository's GitHub
+release notes into a **Release notes** section in the GitOps pull request,
+including a link to the source release. It looks up the release by the resolved
+`tag`, so this also works when chaining `release-bump.yml` without a release
+event. The existing pull request description is preserved, and reruns refresh
+the release notes section instead of adding duplicates. Releases without notes
+are explicitly marked as such. The workflow uses the caller's `GITHUB_TOKEN`
+with `contents: read` to fetch the source release and the inherited `TOKEN` to
+update the GitOps pull request, so no additional token permissions are needed.
+Lookup or update failures fail the job rather than silently omitting the notes.
+
 Hardened `worker`, `api` and `mongo-task` profiles use `mongo:8` for their
 isolated smoke-test service by default. Callers may set `smoke_mongodb_image`
 to another compatible image, for example `mongo:7` when MongoDB 8 cannot start
