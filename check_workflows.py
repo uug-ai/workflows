@@ -159,9 +159,39 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: legacy callers must not require OIDC")
 
     jobs = data["jobs"]
-    for job_id in ("build", "create-manifest"):
-        if jobs[job_id]["if"] != "${{ !inputs.hardened && inputs.publish }}":
-            errors.append(f"release-create.yml: {job_id} must isolate legacy builds")
+    if jobs["build"]["if"] != "${{ !inputs.hardened }}":
+        errors.append("release-create.yml: standard builds must also run without publication")
+    if jobs["create-manifest"]["if"] != "${{ !inputs.hardened && inputs.publish }}":
+        errors.append("release-create.yml: standard manifests require publication")
+    build_steps = jobs["build"]["steps"]
+    checkout = next(step for step in build_steps if step.get("name") == "Checkout")
+    if checkout.get("with", {}).get("ref") != "${{ inputs.tag || github.sha }}":
+        errors.append("release-create.yml: standard builds must use the requested immutable source")
+    for step in build_steps:
+        if step.get("name", "").startswith("Run ") and "dependency build" in step["name"]:
+            for argument, output in (("VERSION", "version"), ("REVISION", "revision"), ("CREATED", "created")):
+                if f'--build-arg "{argument}=${{{{ steps.metadata.outputs.{output} }}}}"' not in step.get("run", ""):
+                    errors.append("release-create.yml: standard builds must retain release image metadata")
+    for name in ("Log in to GitHub Container Registry", "Build and push Docker image"):
+        step = next(step for step in build_steps if step.get("name") == name)
+        if step.get("if") != "inputs.publish":
+            errors.append(f"release-create.yml: {name} must not run in validation-only mode")
+    if inputs.get("use_buildkit_secrets", {}).get("default") is not False:
+        errors.append("release-create.yml: legacy module authentication must remain the default")
+    secret_build = next(
+        (step for step in build_steps if step.get("name") == "Run private dependency build with BuildKit secret"),
+        {},
+    )
+    if (
+        secret_build.get("if") != "${{ inputs.use_private_module_auth && inputs.use_buildkit_secrets }}"
+        or secret_build.get("env", {}).get("GH_TOKEN") != "${{ secrets.TOKEN }}"
+        or '--secret "id=github_token,env=GH_TOKEN"' not in secret_build.get("run", "")
+        or '--build-arg "github_token=' in secret_build.get("run", "")
+    ):
+        errors.append("release-create.yml: standard private builds require opt-in BuildKit secrets")
+    legacy_build = next(step for step in build_steps if step.get("name") == "Run private dependency build")
+    if legacy_build.get("if") != "${{ inputs.use_private_module_auth && !inputs.use_buildkit_secrets }}":
+        errors.append("release-create.yml: legacy and BuildKit authentication must be exclusive")
     if jobs["hardened-source"]["if"] != "inputs.hardened":
         errors.append("release-create.yml: source gates must be opt-in")
     configuration = next(
@@ -392,7 +422,6 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
     required_manifest_order = [
         "Assemble and verify staged multi-platform manifest",
         "Promote verified image tags",
-        "Finalize verified GitHub release",
     ]
     if any(name not in manifest_names for name in required_manifest_order):
         errors.append("release-create.yml: missing staged verification, promotion or release finalization")
@@ -411,28 +440,33 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         errors.append("release-create.yml: unsigned manifests must use a run-specific staging tag")
     if '"$IMAGE:$TAG"' in signing_script or '"$IMAGE:latest"' in signing_script:
         errors.append("release-create.yml: signing must not expose final image tags")
-    finalization = next(
-        (step for step in manifest_steps if step.get("name") == required_manifest_order[2]),
-        {},
-    )
-    if finalization.get("if") != "inputs.finalize_release":
-        errors.append("release-create.yml: GitHub release finalization must remain opt-in")
     evidence_indexes = [
         index for index, step in enumerate(manifest_steps)
         if step.get("uses", "").startswith("actions/upload-artifact@")
     ]
     if (
         not evidence_indexes
-        or required_manifest_order[2] not in manifest_names
-        or max(evidence_indexes) >= manifest_names.index(required_manifest_order[2])
+        or required_manifest_order[1] not in manifest_names
+        or min(evidence_indexes) <= manifest_names.index(required_manifest_order[1])
     ):
-        errors.append("release-create.yml: release finalization must follow evidence upload")
+        errors.append("release-create.yml: promotion must precede release evidence upload")
+    finalization = jobs["finalize-release"]
+    if finalization["needs"] != ["create-manifest", "hardened-manifest"]:
+        errors.append("release-create.yml: release finalization must wait for manifest publication and evidence")
+    if finalization["if"] != (
+        "${{ always() && !cancelled() && inputs.finalize_release && inputs.publish && "
+        "(needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}"
+    ):
+        errors.append("release-create.yml: GitHub release finalization must require opt-in and successful publication")
+    if "permissions" in finalization:
+        errors.append("release-create.yml: optional finalization must inherit caller permissions")
     promotion = jobs["update-gitops"]
-    if promotion["needs"] != ["create-manifest", "hardened-manifest"]:
-        errors.append("release-create.yml: GitOps must wait for either manifest path")
+    if promotion["needs"] != ["create-manifest", "hardened-manifest", "finalize-release"]:
+        errors.append("release-create.yml: GitOps must wait for manifest publication and release finalization")
     if promotion["if"] != (
         "${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && "
-        "(needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}"
+        "(needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') && "
+        "(needs.finalize-release.result == 'success' || needs.finalize-release.result == 'skipped') }}"
     ):
         errors.append("release-create.yml: GitOps must require successful publication")
 

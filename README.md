@@ -170,6 +170,30 @@ caller's `GITHUB_TOKEN`, but it cannot elevate a caller whose permission ceiling
 is read-only. The repository's default workflow permission may remain `read`;
 the explicit caller grant above applies only to this release workflow.
 
+### Opt-in image hardening and release indicators
+
+`hardened` defaults to `false`: native images and multi-platform manifests are
+built normally, without the additional hardening tests, smoke services, security
+gates, SBOM/provenance publication or signing. This does not replace or weaken
+the repository's Dockerfile/runtime restrictions. Set `publish: false` to build
+without registry login, pushes, release edits or GitOps changes; with
+`hardened: true`, validation also runs the hardening gates.
+
+For private-module Dockerfiles that consume `/run/secrets/github_token`, set
+`use_private_module_auth: true` and `use_buildkit_secrets: true`. Standard builds
+then mount `secrets.TOKEN` through BuildKit instead of credential build arguments.
+The option defaults to `false` to preserve older Dockerfiles; hardened builds
+always use BuildKit secrets.
+
+Set `finalize_release: true` and grant `contents: write` to record the image's
+hardening status in the release notes after either manifest path succeeds:
+**Image hardening: Verified (security checks, SBOM, provenance and signing)** or
+**Image hardening: Not verified (standard build)**. The generated indicator is
+replaced on retries without deleting existing release notes or translation
+summaries. Existing published releases retain their publication state; drafts
+are finalized only after successful image publication. GitOps waits for this
+update, and failures/dry runs do not claim a successful hardened release.
+
 ### Hardened Go worker releases
 
 The existing `release-create.yml` also owns the hardened release path; callers
@@ -238,7 +262,7 @@ jobs:
 This call belongs after `needs: bump-release` in a manually dispatched bump
 wrapper. Set `draft: true` on its `release-bump.yml` call: it explicitly reserves
 the source tag and creates a draft with generated notes. With
-`finalize_release: true`, the hardened release job publishes that draft only
+`finalize_release: true`, the common finalization job publishes that draft only
 after all image checks, signature verification, final tag digest checks and
 release-evidence upload succeed. GitOps waits for this entire job to succeed.
 Keep the draft-release route as the sole release entrypoint; a
@@ -416,15 +440,22 @@ on:
         type: choice
         options: [major, minor, patch]
 
+      hardened:
+        description: Run image hardening checks, SBOM, provenance and signing (slower)
+        type: boolean
+        default: false
+
 permissions:
   contents: write
   packages: write
+  id-token: write
 
 jobs:
   bump-release:
     uses: uug-ai/workflows/.github/workflows/release-bump.yml@main
     with:
-      bump: ${{ github.event.inputs.bump }}
+      bump: ${{ inputs.bump }}
+      draft: true
     secrets: inherit
 
   release:
@@ -433,6 +464,11 @@ jobs:
     with:
       project: ${{ github.event.repository.name }}
       tag: ${{ needs.bump-release.outputs.tag }}
+      hardened: ${{ inputs.hardened }}
+      hardened_profile: worker
+      smoke_queue: my-service-queue
+      use_private_module_auth: false
+      finalize_release: true
       create_gitops_pr: true
       gitops_repo: your-org/gitops
       gitops_file: environments/staging/my-service/values.yaml
@@ -442,6 +478,8 @@ jobs:
 ```
 
 The `bump` input accepts `major`, `minor`, or `patch` and defaults to `patch`.
+The `hardened` boolean renders an unchecked checkbox on **Run workflow**.
+Choose the appropriate `hardened_profile` and its runtime inputs for the caller.
 
 ## Manual workflow example
 

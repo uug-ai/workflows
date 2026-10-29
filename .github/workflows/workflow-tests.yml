@@ -38,6 +38,8 @@ jobs:
         run: python -m unittest discover -s .github/actions/pr-description -p 'test_*.py'
 
   legacy-release-permissions:
+    # Check caller permissions without building this workflow-only repository.
+    if: ${{ false }}
     permissions:
       contents: read
       packages: write

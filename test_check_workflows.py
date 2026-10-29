@@ -499,6 +499,46 @@ class ReleaseContractsTest(unittest.TestCase):
         self.workflow["jobs"]["hardened-manifest"]["if"] = "inputs.hardened"
         self.assertTrue(self.errors(self.workflow))
 
+    def test_standard_builds_run_in_validation_only_mode(self):
+        self.workflow["jobs"]["build"]["if"] = "${{ !inputs.hardened && inputs.publish }}"
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_standard_validation_cannot_log_in_or_push(self):
+        for name in ("Log in to GitHub Container Registry", "Build and push Docker image"):
+            with self.subTest(name=name):
+                workflow = copy.deepcopy(self.workflow)
+                step = next(step for step in workflow["jobs"]["build"]["steps"] if step.get("name") == name)
+                step.pop("if")
+                self.assertTrue(self.errors(workflow))
+
+    def test_standard_builds_use_the_requested_source_tag(self):
+        self.workflow["jobs"]["build"]["steps"][0].pop("with")
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_standard_builds_preserve_image_version_revision_and_created_metadata(self):
+        for name in ("Run public dependency build", "Run private dependency build",
+                     "Run private dependency build with BuildKit secret"):
+            for argument, output in (("VERSION", "version"), ("REVISION", "revision"), ("CREATED", "created")):
+                with self.subTest(name=name, argument=argument):
+                    workflow = copy.deepcopy(self.workflow)
+                    step = next(step for step in workflow["jobs"]["build"]["steps"] if step.get("name") == name)
+                    step["run"] = step["run"].replace(
+                        f'--build-arg "{argument}=${{{{ steps.metadata.outputs.{output} }}}}"', "",
+                    )
+                    self.assertTrue(self.errors(workflow))
+
+    def test_standard_buildkit_authentication_is_scoped_and_exclusive(self):
+        for name, key in (
+            ("Run private dependency build with BuildKit secret", "env"),
+            ("Run private dependency build with BuildKit secret", "if"),
+            ("Run private dependency build", "if"),
+        ):
+            with self.subTest(name=name, key=key):
+                workflow = copy.deepcopy(self.workflow)
+                step = next(step for step in workflow["jobs"]["build"]["steps"] if step.get("name") == name)
+                step.pop(key)
+                self.assertTrue(self.errors(workflow))
+
     def test_promotion_must_wait_for_verified_manifest(self):
         self.workflow["jobs"]["update-gitops"]["needs"] = ["build"]
         self.assertTrue(self.errors(self.workflow))
@@ -517,7 +557,6 @@ class ReleaseContractsTest(unittest.TestCase):
         for name in (
             "Assemble and verify staged multi-platform manifest",
             "Promote verified image tags",
-            "Finalize verified GitHub release",
         ):
             with self.subTest(name=name):
                 workflow = copy.deepcopy(self.workflow)
@@ -540,13 +579,25 @@ class ReleaseContractsTest(unittest.TestCase):
         self.assertTrue(self.errors(self.workflow))
 
     def test_release_finalization_cannot_precede_evidence_upload(self):
-        steps = self.workflow["jobs"]["hardened-manifest"]["steps"]
-        finalization = steps.pop()
-        steps.insert(0, finalization)
+        self.workflow["jobs"]["finalize-release"]["needs"] = ["hardened-images"]
         self.assertTrue(self.errors(self.workflow))
 
     def test_release_finalization_cannot_be_unconditional(self):
-        self.workflow["jobs"]["hardened-manifest"]["steps"][-1]["if"] = "always()"
+        self.workflow["jobs"]["finalize-release"]["if"] = "always()"
+        self.assertTrue(self.errors(self.workflow))
+
+    def test_release_finalization_supports_both_manifest_paths(self):
+        for job in ("create-manifest", "hardened-manifest"):
+            with self.subTest(job=job):
+                workflow = copy.deepcopy(self.workflow)
+                workflow["jobs"]["finalize-release"]["needs"] = [job]
+                self.assertTrue(self.errors(workflow))
+
+    def test_gitops_cannot_ignore_release_metadata_failure(self):
+        self.workflow["jobs"]["update-gitops"]["if"] = (
+            "${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && "
+            "(needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}"
+        )
         self.assertTrue(self.errors(self.workflow))
 
     def test_bump_preserves_legacy_default(self):
@@ -596,9 +647,12 @@ case "$tool" in
   gh)
     if [ "$2" = view ]; then
       if [ "$FAIL_AT" = release-view ]; then exit 1; fi
-      printf '%s\\n' "$DRAFT_STATE"
-    elif [ "$2" = edit ] && [ "$FAIL_AT" = release-edit ]; then
-      exit 1
+      cat "$STATE_DIR/release-state.json"
+    elif [ "$2" = edit ]; then
+      if [ "$FAIL_AT" = release-edit ]; then exit 1; fi
+      jq --rawfile body release-notes.md '.body = $body | .isDraft = false' \
+        "$STATE_DIR/release-state.json" > "$STATE_DIR/updated-release.json"
+      mv "$STATE_DIR/updated-release.json" "$STATE_DIR/release-state.json"
     fi
     ;;
   git)
@@ -609,7 +663,11 @@ esac
 
     def setUp(self):
         workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
-        self.steps = workflow["jobs"]["hardened-manifest"]["steps"]
+        self.finalization_script = workflow["jobs"]["finalize-release"]["steps"][0]["run"]
+        self.steps = [
+            *workflow["jobs"]["hardened-manifest"]["steps"],
+            *workflow["jobs"]["finalize-release"]["steps"],
+        ]
         self.registry_gate = next(
             step["run"] for step in workflow["jobs"]["hardened-images"]["steps"]
             if step.get("name") == "Gate immutable published image"
@@ -628,9 +686,13 @@ esac
     def execute(self, scripts, fail_at="", draft_state="true", draft="true", report=None,
                 profile="worker", browser_report=None, browser_inventory=False, rootfs_files="",
                 apk_database=None, spdx_report=None, published_report=None,
-                apk_path="lib/apk/db/installed"):
+                apk_path="lib/apk/db/installed", hardened=True,
+                release_body="Existing release notes.\n"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "release-state.json").write_text(json.dumps({
+                "isDraft": json.loads(draft_state), "body": release_body,
+            }))
             for command in ("docker", "cosign", "gh", "git"):
                 executable = root / command
                 executable.write_text(self.COMMAND_STUB)
@@ -661,6 +723,7 @@ esac
                 FAIL_AT=fail_at,
                 DRAFT_STATE=draft_state,
                 DRAFT=draft,
+                HARDENED=str(hardened).lower(),
                 PROFILE=profile,
                 BROWSER_INVENTORY="true" if profile == "frontend" or browser_inventory else "false",
                 NATIVE_INVENTORY_POLICY=load_yaml(WORKFLOWS_DIR / "release-create.yml")[
@@ -852,7 +915,11 @@ esac
                 f"docker buildx imagetools create -t ghcr.io/uug-ai/{target} "
             ))
             self.assertGreater(index, verify_index)
-        self.assertEqual(events[-1], "gh release edit v1.2.3 --repo uug-ai/example --draft=false --verify-tag")
+        self.assertEqual(
+            events[-1],
+            "gh release edit v1.2.3 --repo uug-ai/example "
+            "--notes-file release-notes.md --draft=false --verify-tag",
+        )
 
     def test_staging_or_signing_failure_does_not_expose_final_tags(self):
         for point in ("stage", "stage-inspect", "sign", "verify"):
@@ -955,11 +1022,88 @@ esac
                 result, _, _ = self.execute(self.manifest_scripts(), fail_at=point)
                 self.assertNotEqual(result.returncode, 0)
 
-    def test_already_published_release_is_not_modified(self):
+    def test_already_published_release_state_is_preserved_when_notes_are_refreshed(self):
         result, events, _ = self.execute(self.manifest_scripts(), draft_state="false")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertFalse(any(event.startswith("gh release edit ") for event in events))
+        edit = next(event for event in events if event.startswith("gh release edit "))
+        self.assertNotIn("--draft=false", edit)
         self.assertIn("already published", result.stdout)
+
+    def test_release_notes_show_verified_or_standard_hardening_without_losing_notes(self):
+        for hardened, status in (
+            (True, "Verified (security checks, SBOM, provenance and signing)"),
+            (False, "Not verified (standard build)"),
+        ):
+            with self.subTest(hardened=hardened):
+                notes = "## Changes\n\nOriginal notes, translations and [assets](https://example.com).\n"
+                result, events, _ = self.execute(
+                    [self.finalization_script, "cat release-notes.md"],
+                    hardened=hardened, release_body=notes,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"**Image hardening: {status}**", result.stdout)
+                self.assertTrue(result.stdout.endswith(notes))
+                self.assertIn("--draft=false --verify-tag", events[-1])
+
+    def test_release_note_indicator_is_idempotent(self):
+        for notes in ("Release notes without a final newline", "Release notes\n", None, ""):
+            with self.subTest(notes=notes):
+                result, _, _ = self.execute([
+                    self.finalization_script,
+                    "cp release-notes.md first-notes.md",
+                    self.finalization_script,
+                    "cmp first-notes.md release-notes.md",
+                    "cat release-notes.md",
+                ], release_body=notes)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.count("<!-- image-hardening:start -->"), 1)
+
+    def test_retry_replaces_previous_hardening_status(self):
+        for hardened in (False, True):
+            with self.subTest(hardened=hardened):
+                previous = (
+                    "<!-- image-hardening:start -->\n"
+                    "**Image hardening: Old status**\n"
+                    "<!-- image-hardening:end -->\n\n"
+                    "Original release notes.\n"
+                )
+                result, _, _ = self.execute(
+                    [self.finalization_script, "cat release-notes.md"],
+                    hardened=hardened, release_body=previous,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.count("<!-- image-hardening:start -->"), 1)
+                self.assertNotIn("Old status", result.stdout)
+                self.assertTrue(result.stdout.endswith("Original release notes.\n"))
+
+    def test_standard_private_build_uses_buildkit_secret_and_surfaces_errors(self):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        script = next(
+            step["run"] for step in workflow["jobs"]["build"]["steps"]
+            if step.get("name") == "Run private dependency build with BuildKit secret"
+        )
+        for expression, value in (("${{ matrix.architecture }}", "amd64"),
+                                  ("${{ env.PROJECT }}", "example"),
+                                  ("${{ env.BUILD_CONTEXT }}", "."),
+                                  ("${{ steps.metadata.outputs.version }}", "v1.2.3"),
+                                  ("${{ steps.metadata.outputs.revision }}", "source-commit"),
+                                  ("${{ steps.metadata.outputs.created }}", "2026-10-29T11:54:26Z")):
+            script = script.replace(expression, value)
+        for token, docker_status, expected in (("", 0, 1), ("fixture-secret", 0, 0),
+                                                ("fixture-secret", 42, 42)):
+            with self.subTest(token=bool(token), docker_status=docker_status):
+                result = subprocess.run(
+                    ["bash", "-e", "-c",
+                     'docker() { printf "%s\\n" "$@"; return "$DOCKER_STATUS"; }\n' + script],
+                    env=dict(os.environ, GH_TOKEN=token, DOCKER_STATUS=str(docker_status)),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertNotIn("fixture-secret", result.stdout + result.stderr)
+                if token:
+                    self.assertIn("id=github_token,env=GH_TOKEN", result.stdout)
+                else:
+                    self.assertIn("::error::Private module builds require the TOKEN secret", result.stdout)
 
     def test_invalid_release_state_is_an_explicit_error(self):
         result, events, _ = self.execute(self.manifest_scripts(), draft_state="null")
