@@ -11,6 +11,11 @@ on:
         description: 'Reserve the source tag and keep the release draft until verified publication'
         type: boolean
         default: false
+      hotfix_base:
+        description: 'Release to hotfix, such as v1.19.29; tags the head of release/<base> as the next <base>.N and ignores bump'
+        required: false
+        type: string
+        default: ''
     outputs:
       tag:
         description: 'The newly created release tag'
@@ -34,11 +39,59 @@ jobs:
         id: version
         env:
           BUMP: ${{ inputs.bump || 'patch' }}
+          HOTFIX_BASE: ${{ inputs.hotfix_base }}
         run: |
           set -euo pipefail
 
-          # Get the latest semver tag, default to v0.0.0 when none exist.
-          latest=$(git tag --list 'v*' --sort=-v:refname | head -n 1)
+          if [ -n "$HOTFIX_BASE" ]; then
+            base="$HOTFIX_BASE"
+            if ! printf '%s' "$base" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::hotfix_base must be a three-part release tag such as v1.19.29, got '$base'"
+              exit 1
+            fi
+            if ! git rev-parse -q --verify "refs/tags/$base" >/dev/null; then
+              echo "::error::Release tag $base does not exist"
+              exit 1
+            fi
+            branch="release/$base"
+            if ! git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null; then
+              echo "::error::Branch $branch does not exist; create it from $base and merge the hotfix into it first"
+              exit 1
+            fi
+            target=$(git rev-parse "refs/remotes/origin/$branch^{commit}")
+            if ! git merge-base --is-ancestor "$base" "$target"; then
+              echo "::error::$branch ($target) does not contain $base"
+              exit 1
+            fi
+
+            escaped=${base//./\\.}
+            previous=$(git tag --list "$base.*" | grep -E "^${escaped}\.[0-9]+$" | sort -V | tail -n 1 || true)
+            if [ -n "$previous" ]; then
+              last=${previous##*.}
+            else
+              previous="$base"
+              last=0
+            fi
+            if git tag --points-at "$target" | grep -Eqx "${escaped}(\.[0-9]+)?"; then
+              echo "::error::The head of $branch ($target) is already released; merge the hotfix into $branch first"
+              exit 1
+            fi
+
+            next="$base.$((last + 1))"
+            echo "Hotfix of $base from $branch at $target (previous: $previous)"
+            echo "Next tag: $next"
+            {
+              echo "tag=$next"
+              echo "target=$target"
+              echo "notes_start=$previous"
+              echo "latest=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Latest three-part semver tag; hotfix tags (vX.Y.Z.N) are ignored.
+          # Default to v0.0.0 when none exist.
+          latest=$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
           if [ -z "$latest" ]; then
             latest="v0.0.0"
           fi
@@ -72,23 +125,38 @@ jobs:
 
           next="v${major}.${minor}.${patch}"
           echo "Next tag: $next"
-          echo "tag=$next" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$next"
+            echo "target=$GITHUB_SHA"
+            echo "notes_start="
+            echo "latest=true"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
+          TARGET: ${{ steps.version.outputs.target }}
+          NOTES_START: ${{ steps.version.outputs.notes_start }}
+          LATEST: ${{ steps.version.outputs.latest }}
           DRAFT: ${{ inputs.draft }}
         run: |
           set -euo pipefail
+          target="${TARGET:-$GITHUB_SHA}"
           options=()
+          if [ -n "${NOTES_START:-}" ]; then
+            options+=(--notes-start-tag "$NOTES_START")
+          fi
+          if [ "${LATEST:-true}" = false ]; then
+            options+=(--latest=false)
+          fi
           if [ "$DRAFT" = true ]; then
             # Draft releases do not reliably create a checkoutable source tag.
-            git tag "$TAG" "$GITHUB_SHA"
+            git tag "$TAG" "$target"
             git push origin "refs/tags/$TAG"
             options+=(--draft --verify-tag)
           fi
           gh release create "$TAG" \
-            --target "$GITHUB_SHA" \
+            --target "$target" \
             --title "$TAG" \
             --generate-notes "${options[@]}"

@@ -492,6 +492,46 @@ The `bump` input accepts `major`, `minor`, or `patch` and defaults to `patch`.
 The `hardened` boolean renders an unchecked checkbox on **Run workflow**.
 Choose the appropriate `hardened_profile` and its runtime inputs for the caller.
 
+The next version is computed from three-part `vX.Y.Z` tags only. Hotfix tags
+such as `v1.19.29.1` don't affect it.
+
+### Hotfix releases
+
+Set `hotfix_base` to an existing release, such as `v1.19.29`, to release a fix
+for that version instead of bumping main:
+
+1. Create the branch `release/v1.19.29` from the `v1.19.29` tag and merge the fix into it.
+2. Dispatch the bump workflow from main with `hotfix_base: v1.19.29`. `bump` is ignored.
+
+The workflow tags the head of `release/v1.19.29` as the next free
+`v1.19.29.N` (`v1.19.29.1`, then `v1.19.29.2`, ...). The release notes start at
+the previous hotfix tag, or at the base release for the first one. The run fails
+when the branch is missing, doesn't contain the base tag, or its head is already
+released.
+
+A hotfix is not the newest release. Pass `latest: false` to `release-create.yml`
+so it doesn't move the `latest` image tag or GitHub's **Latest** badge, and leave
+out the staging GitOps pull request:
+
+```yaml
+  bump-release:
+    uses: uug-ai/workflows/.github/workflows/release-bump.yml@main
+    with:
+      bump: ${{ inputs.bump }}
+      hotfix_base: ${{ inputs.hotfix_base }}
+      draft: true
+
+  release:
+    needs: bump-release
+    uses: uug-ai/workflows/.github/workflows/release-create.yml@main
+    with:
+      tag: ${{ needs.bump-release.outputs.tag }}
+      latest: ${{ inputs.hotfix_base == '' }}
+      create_gitops_pr: ${{ inputs.hotfix_base == '' }}
+      finalize_release: true
+      # ...
+```
+
 ## Manual workflow example
 
 ```yaml
