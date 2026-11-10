@@ -1378,7 +1378,9 @@ class ReleaseVersionTest(unittest.TestCase):
         ).stdout.strip()
 
     def commit(self, *tags):
-        self.git("commit", "-q", "--allow-empty", "-m", "commit")
+        # Unique messages: identical empty commits made in the same second share a SHA.
+        self.commits = getattr(self, "commits", 0) + 1
+        self.git("commit", "-q", "--allow-empty", "-m", f"commit {self.commits}")
         for tag in tags:
             self.git("tag", tag)
         return self.git("rev-parse", "HEAD")
