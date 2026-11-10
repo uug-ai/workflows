@@ -74,6 +74,10 @@ on:
         description: 'Record image hardening status and publish an existing draft after image publication succeeds'
         type: boolean
         default: false
+      latest:
+        description: 'Move the latest image tag and the GitHub Latest release badge to this release; false for hotfixes of older releases'
+        type: boolean
+        default: true
       smoke_queue:
         description: 'RabbitMQ consumer queue required by the hardened MongoDB/RabbitMQ worker smoke test'
         type: string
@@ -147,6 +151,7 @@ env:
   ORGANIZATION: ${{ inputs.organization || 'uug-ai' }}
   PROJECT: ${{ inputs.project || github.event.repository.name }}
   TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  LATEST: ${{ inputs.latest }}
   BUILD_CONTEXT: ${{ inputs.docker_context || '.' }}
   RUNNER_MATRIX: ${{ inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]' }}
   GITOPS_REPO: ${{ inputs.gitops_repo || 'uug-ai/gitops' }}
@@ -265,8 +270,10 @@ jobs:
           docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:$TAG" "${image_refs[@]}"
           docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:$TAG"
 
-          docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:latest" "${image_refs[@]}"
-          docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:latest"
+          if [ "$LATEST" = true ]; then
+            docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:latest" "${image_refs[@]}"
+            docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:latest"
+          fi
 
   hardened-source:
     if: inputs.hardened
@@ -820,7 +827,9 @@ jobs:
             promote "$PLATFORM_IMAGE:$architecture-$TAG" "$PLATFORM_IMAGE" "$(cat "$file")"
           done
           promote "$IMAGE:$TAG" "$IMAGE" "$digest"
-          promote "$IMAGE:latest" "$IMAGE" "$digest"
+          if [ "$LATEST" = true ]; then
+            promote "$IMAGE:latest" "$IMAGE" "$digest"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix }}-release
@@ -851,6 +860,14 @@ jobs:
               ;;
             *)
               echo "::error::Unexpected draft state for release $TAG: $draft"
+              exit 1
+              ;;
+          esac
+          case "$LATEST" in
+            true) ;;
+            false) args+=(--latest=false) ;;
+            *)
+              echo "::error::Unexpected latest state: $LATEST"
               exit 1
               ;;
           esac

@@ -700,7 +700,7 @@ esac
                 profile="worker", browser_report=None, browser_inventory=False, rootfs_files="",
                 apk_database=None, spdx_report=None, published_report=None,
                 apk_path="lib/apk/db/installed", hardened=True,
-                release_body="Existing release notes.\n"):
+                release_body="Existing release notes.\n", latest=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "release-state.json").write_text(json.dumps({
@@ -737,6 +737,7 @@ esac
                 DRAFT_STATE=draft_state,
                 DRAFT=draft,
                 HARDENED=str(hardened).lower(),
+                LATEST=str(latest).lower(),
                 PROFILE=profile,
                 BROWSER_INVENTORY="true" if profile == "frontend" or browser_inventory else "false",
                 NATIVE_INVENTORY_POLICY=load_yaml(WORKFLOWS_DIR / "release-create.yml")[
@@ -933,6 +934,24 @@ esac
             "gh release edit v1.2.3 --repo uug-ai/example "
             "--notes-file release-notes.md --draft=false --verify-tag",
         )
+
+    def test_hotfix_release_keeps_latest_tag_and_badge(self):
+        result, events, verified = self.execute(self.manifest_scripts(), latest=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(verified)
+        self.assertTrue(any("ghcr.io/uug-ai/example:v1.2.3 " in event for event in events))
+        self.assertFalse(any("example:latest" in event for event in events))
+        self.assertEqual(
+            events[-1],
+            "gh release edit v1.2.3 --repo uug-ai/example "
+            "--notes-file release-notes.md --draft=false --verify-tag --latest=false",
+        )
+
+    def test_unexpected_latest_state_is_an_explicit_error(self):
+        result, events, _ = self.execute([self.finalization_script], latest="maybe")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("::error::Unexpected latest state", result.stdout)
+        self.assertFalse(any(event.startswith("gh release edit ") for event in events))
 
     def test_staging_or_signing_failure_does_not_expose_final_tags(self):
         for point in ("stage", "stage-inspect", "sign", "verify"):
@@ -1148,6 +1167,19 @@ esac
         self.assertNotIn("--draft", events[0])
         self.assertNotIn("--verify-tag", events[0])
 
+    def test_hotfix_bump_targets_release_branch_without_latest_badge(self):
+        result, events, _ = self.execute([
+            "TARGET=branch-head NOTES_START=v1.2.2.1 LATEST=false",
+            self.bump_script,
+        ])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(events[:2], [
+            "git tag v1.2.3 branch-head",
+            "git push origin refs/tags/v1.2.3",
+        ])
+        self.assertIn("--target branch-head ", events[2])
+        self.assertIn("--notes-start-tag v1.2.2.1 --latest=false --draft --verify-tag", events[2])
+
     def test_hardened_configuration_requires_only_profile_dependencies(self):
         workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
         script = next(
@@ -1323,6 +1355,123 @@ esac
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("requires secrets.TOKEN", result.stdout)
+
+class ReleaseVersionTest(unittest.TestCase):
+    def setUp(self):
+        bump = load_yaml(WORKFLOWS_DIR / "release-bump.yml")
+        self.script = next(
+            step["run"] for step in bump["jobs"]["bump-release"]["steps"]
+            if step.get("name") == "Determine next version"
+        )
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "test@example.com")
+        self.git("config", "user.name", "Test")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", *args], cwd=self.root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def commit(self, *tags):
+        self.git("commit", "-q", "--allow-empty", "-m", "commit")
+        for tag in tags:
+            self.git("tag", tag)
+        return self.git("rev-parse", "HEAD")
+
+    def branch(self, name, sha):
+        self.git("update-ref", f"refs/remotes/origin/{name}", sha)
+
+    def run_version(self, hotfix_base="", bump="patch"):
+        output = self.root / "output"
+        output.write_text("")
+        result = subprocess.run(
+            ["bash", "-e", "-c", self.script], cwd=self.root, capture_output=True, text=True,
+            env=dict(os.environ, BUMP=bump, HOTFIX_BASE=hotfix_base,
+                     GITHUB_SHA=self.git("rev-parse", "HEAD"), GITHUB_OUTPUT=str(output)),
+        )
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines() if line)
+        return result, values
+
+    def test_first_hotfix_tags_release_branch_head(self):
+        self.commit("v1.19.29")
+        head = self.commit()
+        self.branch("release/v1.19.29", head)
+        self.git("checkout", "-q", "-b", "other")
+        self.commit("v1.19.34")
+        result, values = self.run_version("v1.19.29")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(values, {
+            "tag": "v1.19.29.1", "target": head, "notes_start": "v1.19.29", "latest": "false",
+        })
+
+    def test_next_hotfix_increments_highest_existing_number(self):
+        self.commit("v1.19.29")
+        self.commit("v1.19.29.1")
+        self.commit("v1.19.29.9")
+        self.commit("v1.19.29.10")
+        head = self.commit()
+        self.branch("release/v1.19.29", head)
+        self.git("tag", "v1.19.290")
+        result, values = self.run_version("v1.19.29")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(values["tag"], "v1.19.29.11")
+        self.assertEqual(values["notes_start"], "v1.19.29.10")
+
+    def test_hotfix_rejects_unchanged_or_missing_branch_and_bad_base(self):
+        base = self.commit("v1.19.29")
+        cases = (
+            ("v1.19.29", None, "does not exist; create it"),
+            ("v1.19.29", base, "already released"),
+            ("1.19.29", base, "three-part release tag"),
+            ("v1.19.29.1", base, "three-part release tag"),
+            ("v1.19.30", base, "Release tag v1.19.30 does not exist"),
+        )
+        for hotfix_base, branch_head, message in cases:
+            with self.subTest(hotfix_base=hotfix_base, branch=bool(branch_head)):
+                if branch_head:
+                    self.branch("release/v1.19.29", branch_head)
+                result, values = self.run_version(hotfix_base)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stdout)
+                self.assertEqual(values, {})
+
+    def test_hotfix_rejects_already_released_hotfix_head(self):
+        self.commit("v1.19.29")
+        head = self.commit("v1.19.29.1")
+        self.branch("release/v1.19.29", head)
+        result, _ = self.run_version("v1.19.29")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already released", result.stdout)
+
+    def test_hotfix_rejects_branch_without_base(self):
+        self.commit("v1.19.29")
+        self.git("checkout", "-q", "--orphan", "unrelated")
+        self.branch("release/v1.19.29", self.commit())
+        result, _ = self.run_version("v1.19.29")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not contain v1.19.29", result.stdout)
+
+    def test_regular_bump_ignores_hotfix_tags(self):
+        self.commit("v1.19.34")
+        self.commit("v1.19.34.1")
+        for bump, expected in (("patch", "v1.19.35"), ("minor", "v1.20.0"), ("major", "v2.0.0")):
+            with self.subTest(bump=bump):
+                result, values = self.run_version(bump=bump)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(values["tag"], expected)
+                self.assertEqual(values["latest"], "true")
+                self.assertEqual(values["notes_start"], "")
+
+    def test_regular_bump_starts_at_first_patch_without_tags(self):
+        self.commit()
+        result, values = self.run_version()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(values["tag"], "v0.0.1")
 
 
 if __name__ == "__main__":
