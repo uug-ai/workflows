@@ -545,17 +545,24 @@ such as `v1.19.29.1` don't affect it.
 
 ### Hotfix releases
 
-Set `hotfix_base` to an existing release, such as `v1.19.29`, to release a fix
-for that version instead of bumping main:
+Set `bump` to `hotfix` and `hotfix_base` to an existing release, such as
+`v1.19.29`, to release a fix for that version instead of bumping main:
 
 1. Create the branch `release/v1.19.29` from the `v1.19.29` tag and merge the fix into it.
-2. Dispatch the bump workflow from main with `hotfix_base: v1.19.29`. `bump` is ignored.
+2. Dispatch the bump workflow from main with `bump: hotfix` and `hotfix_base: v1.19.29`.
+
+`hotfix_base` also accepts `1.19.29` or one of its hotfixes, such as
+`v1.19.29.1`; both resolve to the base release `v1.19.29`. The run fails when
+`hotfix` is chosen without a base, or a base is given with another bump.
 
 The workflow tags the head of `release/v1.19.29` as the next free
 `v1.19.29.N` (`v1.19.29.1`, then `v1.19.29.2`, ...). The release notes start at
 the previous hotfix tag, or at the base release for the first one. The run fails
 when the branch is missing, doesn't contain the base tag, or its head is already
 released.
+
+Add `hotfix` to the caller's `bump` choices. GitHub can't hide inputs based on
+another input, so `hotfix_base` is always shown on **Run workflow**.
 
 A hotfix is not the newest release. Pass `latest: false` to `release-create.yml`
 so it doesn't move the `latest` image tag or GitHub's **Latest** badge, and leave
@@ -574,8 +581,8 @@ out the staging GitOps pull request:
     uses: uug-ai/workflows/.github/workflows/release-create.yml@main
     with:
       tag: ${{ needs.bump-release.outputs.tag }}
-      latest: ${{ inputs.hotfix_base == '' }}
-      create_gitops_pr: ${{ inputs.hotfix_base == '' }}
+      latest: ${{ inputs.bump != 'hotfix' }}
+      create_gitops_pr: ${{ inputs.bump != 'hotfix' }}
       finalize_release: true
       # ...
 ```

@@ -3,7 +3,7 @@ on:
   workflow_call:
     inputs:
       bump:
-        description: 'Which part of the version to bump (major, minor, patch)'
+        description: 'Which part of the version to bump (major, minor, patch, or hotfix with hotfix_base)'
         required: false
         type: string
         default: 'patch'
@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       hotfix_base:
-        description: 'Release to hotfix, such as v1.19.29; tags the head of release/<base> as the next <base>.N and ignores bump'
+        description: 'Release to hotfix with bump hotfix, such as v1.19.29 or one of its hotfixes (v1.19.29.1); tags the head of release/<base> as the next <base>.N'
         required: false
         type: string
         default: ''
@@ -43,11 +43,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -n "$HOTFIX_BASE" ]; then
-            base="$HOTFIX_BASE"
-            if ! printf '%s' "$base" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-              echo "::error::hotfix_base must be a three-part release tag such as v1.19.29, got '$base'"
+          if [ "$BUMP" = hotfix ] && [ -z "$HOTFIX_BASE" ]; then
+            echo "::error::A hotfix needs the release to fix in hotfix_base, such as v1.19.29"
+            exit 1
+          fi
+          if [ "$BUMP" != hotfix ] && [ -n "$HOTFIX_BASE" ]; then
+            echo "::error::hotfix_base is only used with bump hotfix (got bump $BUMP); choose hotfix or clear hotfix_base"
+            exit 1
+          fi
+
+          if [ "$BUMP" = hotfix ]; then
+            # Accept v1.19.29, 1.19.29 or a hotfix of it such as v1.19.29.1.
+            requested=$(printf '%s' "$HOTFIX_BASE" | tr -d '[:space:]')
+            if ! printf '%s' "$requested" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+              echo "::error::hotfix_base must be a release such as v1.19.29 or v1.19.29.1, got '$HOTFIX_BASE'"
               exit 1
+            fi
+            requested="v${requested#v}"
+            base=$(printf '%s' "$requested" | cut -d. -f1-3)
+            if [ "$requested" != "$base" ]; then
+              echo "Using base release $base for $requested"
             fi
             if ! git rev-parse -q --verify "refs/tags/$base" >/dev/null; then
               echo "::error::Release tag $base does not exist"

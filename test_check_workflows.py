@@ -1536,7 +1536,9 @@ class ReleaseVersionTest(unittest.TestCase):
     def branch(self, name, sha):
         self.git("update-ref", f"refs/remotes/origin/{name}", sha)
 
-    def run_version(self, hotfix_base="", bump="patch"):
+    def run_version(self, hotfix_base="", bump=None):
+        if bump is None:
+            bump = "hotfix" if hotfix_base else "patch"
         output = self.root / "output"
         output.write_text("")
         result = subprocess.run(
@@ -1577,8 +1579,8 @@ class ReleaseVersionTest(unittest.TestCase):
         cases = (
             ("v1.19.29", None, "does not exist; create it"),
             ("v1.19.29", base, "already released"),
-            ("1.19.29", base, "three-part release tag"),
-            ("v1.19.29.1", base, "three-part release tag"),
+            ("v1.19", base, "must be a release such as"),
+            ("v1.19.29-rc.1", base, "must be a release such as"),
             ("v1.19.30", base, "Release tag v1.19.30 does not exist"),
         )
         for hotfix_base, branch_head, message in cases:
@@ -1586,6 +1588,30 @@ class ReleaseVersionTest(unittest.TestCase):
                 if branch_head:
                     self.branch("release/v1.19.29", branch_head)
                 result, values = self.run_version(hotfix_base)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stdout)
+                self.assertEqual(values, {})
+
+    def test_hotfix_base_accepts_hotfix_tags_and_missing_prefix(self):
+        self.commit("v1.19.29")
+        self.commit("v1.19.29.1")
+        head = self.commit()
+        self.branch("release/v1.19.29", head)
+        for hotfix_base in ("v1.19.29.1", "1.19.29", " v1.19.29.1 ", "v1.19.29.7"):
+            with self.subTest(hotfix_base=hotfix_base):
+                result, values = self.run_version(hotfix_base)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(values["tag"], "v1.19.29.2")
+                self.assertEqual(values["target"], head)
+
+    def test_hotfix_bump_and_base_must_be_given_together(self):
+        self.commit("v1.19.29")
+        for hotfix_base, bump, message in (
+            ("", "hotfix", "needs the release to fix"),
+            ("v1.19.29", "patch", "only used with bump hotfix"),
+        ):
+            with self.subTest(bump=bump):
+                result, values = self.run_version(hotfix_base, bump=bump)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stdout)
                 self.assertEqual(values, {})
