@@ -198,12 +198,60 @@ always use BuildKit secrets.
 
 Set `finalize_release: true` and grant `contents: write` to record the image's
 hardening status in the release notes after either manifest path succeeds:
-**Image hardening: Verified (security checks, SBOM, provenance and signing)** or
+**Image hardening: Verified (security checks, SBOM, provenance and signing)**,
+**Image hardening: Signed (standard build, not hardened)** or
 **Image hardening: Not verified (standard build)**. The generated indicator is
 replaced on retries without deleting existing release notes or translation
 summaries. Existing published releases retain their publication state; drafts
 are finalized only after successful image publication. GitOps waits for this
 update, and failures/dry runs do not claim a successful hardened release.
+
+### Signing standard releases
+
+Set `sign: true` to keyless-sign standard (non-hardened) releases as well, and
+grant the calling release job `id-token: write` in addition to its existing
+permissions. After the version and `latest` manifests are pushed, the
+`sign-manifest` job signs the pushed manifest **digest** with cosign and
+verifies the signature before the release is finalized or a GitOps pull request
+is opened; a signing failure leaves the draft unpublished and opens no GitOps
+pull request. `sign` defaults to `false` because the job inherits the caller's
+OIDC grant, and callers without `id-token: write` must keep working. Hardened
+releases are always signed and ignore this option.
+
+Unlike the hardened path, standard tags are pushed before they are signed, so
+for a short window a new tag can be unsigned. Deployment policies should check
+signatures by digest.
+
+### Verifying signatures and the hardening attestation
+
+Every signature is made by this reusable workflow, so the certificate identity
+is `https://github.com/uug-ai/workflows/.github/workflows/release-create.yml@<ref>`
+for every service. The calling repository is recorded in the certificate's
+GitHub workflow repository claim, and every verification here, and every
+consumer, must require it; the identity alone accepts an image released by any
+repository that calls this workflow:
+
+```bash
+cosign verify ghcr.io/uug-ai/hub-api@sha256:<digest> \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/uug-ai/workflows/\.github/workflows/release-create\.yml@(refs/\S+|[0-9a-f]{40})$' \
+  --certificate-github-workflow-repository uug-ai/hub-api
+```
+
+Hardened releases additionally carry a signed in-toto attestation with predicate
+type `https://github.com/uug-ai/workflows/attestations/image-hardening/v1`. It is
+created and verified after the manifest signature and before any final tag is
+promoted, and records the repository, tag, profile, workflow run, per-platform
+digests and the gates that passed. Use it to admit only hardened images, for
+example in production:
+
+```bash
+cosign verify-attestation ghcr.io/uug-ai/hub-api@sha256:<digest> \
+  --type https://github.com/uug-ai/workflows/attestations/image-hardening/v1 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/uug-ai/workflows/\.github/workflows/release-create\.yml@(refs/\S+|[0-9a-f]{40})$' \
+  --certificate-github-workflow-repository uug-ai/hub-api
+```
 
 ### Hardened Go worker releases
 

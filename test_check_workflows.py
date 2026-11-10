@@ -455,9 +455,90 @@ class ReleaseContractsTest(unittest.TestCase):
                         step["with"][key] = value
                 self.assertTrue(self.errors(workflow))
 
+    def test_standard_signing_stays_opt_in_and_inherits_oidc(self):
+        for change in ("default", "permissions", "unconditional", "before-manifest"):
+            with self.subTest(change=change):
+                workflow = copy.deepcopy(self.workflow)
+                signer = workflow["jobs"]["sign-manifest"]
+                if change == "default":
+                    workflow["on"]["workflow_call"]["inputs"]["sign"]["default"] = True
+                elif change == "permissions":
+                    signer["permissions"] = {"id-token": "write", "packages": "write"}
+                elif change == "unconditional":
+                    signer["if"] = "${{ !inputs.hardened && inputs.publish }}"
+                else:
+                    signer["needs"] = "build"
+                self.assertTrue(self.errors(workflow))
+
+    def test_standard_signing_targets_the_pushed_digest(self):
+        for change in ("tag", "digest-source", "output"):
+            with self.subTest(change=change):
+                workflow = copy.deepcopy(self.workflow)
+                step = next(
+                    step for step in workflow["jobs"]["sign-manifest"]["steps"]
+                    if step.get("name") == "Sign and verify release manifest"
+                )
+                if change == "tag":
+                    step["run"] = step["run"].replace('cosign sign --yes "$IMAGE@$DIGEST"', 'cosign sign --yes "$IMAGE:$TAG"')
+                elif change == "digest-source":
+                    step["env"]["DIGEST"] = "${{ inputs.tag }}"
+                else:
+                    workflow["jobs"]["create-manifest"].pop("outputs")
+                self.assertTrue(self.errors(workflow))
+
+    def test_every_verification_pins_the_caller_repository(self):
+        targets = (
+            ("sign-manifest", "Sign and verify release manifest"),
+            ("hardened-manifest", "Assemble and verify staged multi-platform manifest"),
+            ("hardened-manifest", "Attest and verify hardening result"),
+        )
+        for job, name in targets:
+            for flag in (
+                '--certificate-github-workflow-repository "$GITHUB_REPOSITORY"',
+                "--certificate-oidc-issuer https://token.actions.githubusercontent.com",
+            ):
+                with self.subTest(job=job, name=name, flag=flag):
+                    workflow = copy.deepcopy(self.workflow)
+                    step = next(step for step in workflow["jobs"][job]["steps"] if step.get("name") == name)
+                    self.assertIn(flag, step["run"])
+                    step["run"] = step["run"].replace(flag, "")
+                    self.assertTrue(self.errors(workflow))
+
+    def test_hardening_attestation_cannot_be_removed_or_follow_promotion(self):
+        for change in ("remove", "after-promotion", "tag", "predicate-type"):
+            with self.subTest(change=change):
+                workflow = copy.deepcopy(self.workflow)
+                steps = workflow["jobs"]["hardened-manifest"]["steps"]
+                attest = next(step for step in steps if step.get("name") == "Attest and verify hardening result")
+                if change in ("remove", "after-promotion"):
+                    steps.remove(attest)
+                    if change == "after-promotion":
+                        index = next(i for i, step in enumerate(steps) if step.get("name") == "Promote verified image tags")
+                        steps.insert(index + 1, attest)
+                elif change == "tag":
+                    attest["run"] = attest["run"].replace('"$IMAGE@$digest"', '"$IMAGE:$TAG"')
+                else:
+                    attest["env"]["PREDICATE_TYPE"] = "custom"
+                self.assertTrue(self.errors(workflow))
+
+    def test_finalization_and_gitops_wait_for_requested_standard_signature(self):
+        for job in ("finalize-release", "update-gitops"):
+            for change in ("needs", "condition"):
+                with self.subTest(job=job, change=change):
+                    workflow = copy.deepcopy(self.workflow)
+                    target = workflow["jobs"][job]
+                    if change == "needs":
+                        target["needs"] = [need for need in target["needs"] if need != "sign-manifest"]
+                    else:
+                        target["if"] = target["if"].replace(
+                            " && (!inputs.sign || needs.sign-manifest.result == 'success')", "",
+                        )
+                    self.assertTrue(self.errors(workflow))
+
     def test_read_only_callers_do_not_need_an_oidc_permission_grant(self):
         self.assertNotIn("permissions", self.workflow)
         self.assertNotIn("permissions", self.workflow["jobs"]["hardened-manifest"])
+        self.assertNotIn("permissions", self.workflow["jobs"]["sign-manifest"])
 
     def test_native_images_and_registry_scans_use_platform_package(self):
         for name, key in (
@@ -699,7 +780,7 @@ esac
     def execute(self, scripts, fail_at="", draft_state="true", draft="true", report=None,
                 profile="worker", browser_report=None, browser_inventory=False, rootfs_files="",
                 apk_database=None, spdx_report=None, published_report=None,
-                apk_path="lib/apk/db/installed", hardened=True,
+                apk_path="lib/apk/db/installed", hardened=True, signed=False,
                 release_body="Existing release notes.\n", latest=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -738,10 +819,12 @@ esac
                 DRAFT=draft,
                 HARDENED=str(hardened).lower(),
                 LATEST=str(latest).lower(),
+                SIGNED=str(signed).lower(),
                 PROFILE=profile,
                 BROWSER_INVENTORY="true" if profile == "frontend" or browser_inventory else "false",
                 NATIVE_INVENTORY_POLICY=load_yaml(WORKFLOWS_DIR / "release-create.yml")[
                     "jobs"]["hardened-images"]["env"]["NATIVE_INVENTORY_POLICY"],
+                PREDICATE_TYPE="https://github.com/uug-ai/workflows/attestations/image-hardening/v1",
                 IMAGE="ghcr.io/uug-ai/example",
                 PLATFORM_IMAGE="ghcr.io/uug-ai/example-platform",
                 TAG="v1.2.3",
@@ -911,6 +994,69 @@ esac
     def manifest_scripts(self):
         return [step["run"] for step in self.steps if "run" in step]
 
+    def step_script(self, job, name):
+        workflow = load_yaml(WORKFLOWS_DIR / "release-create.yml")
+        return next(step["run"] for step in workflow["jobs"][job]["steps"] if step.get("name") == name)
+
+    def test_hardening_attestation_describes_the_verified_release(self):
+        result, events, _ = self.execute([
+            self.step_script("hardened-manifest", "Assemble and verify staged multi-platform manifest"),
+            self.step_script("hardened-manifest", "Attest and verify hardening result"),
+            "cat hardening-predicate.json",
+        ], profile="api")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        predicate = json.loads(result.stdout[result.stdout.index("{"):])
+        self.assertEqual(predicate["result"], "passed")
+        self.assertEqual(predicate["repository"], "uug-ai/example")
+        self.assertEqual(predicate["tag"], "v1.2.3")
+        self.assertEqual(predicate["profile"], "api")
+        self.assertEqual(predicate["platforms"], {"amd64": "sha256:amd64", "arm64": "sha256:arm64"})
+        self.assertTrue(predicate["run"].endswith("/uug-ai/example/actions/runs/42/attempts/2"))
+        attest = next(event for event in events if event.startswith("cosign attest "))
+        self.assertTrue(attest.endswith(" ghcr.io/uug-ai/example@sha256:verified"))
+        verify = next(event for event in events if event.startswith("cosign verify-attestation "))
+        self.assertIn("--certificate-github-workflow-repository uug-ai/example", verify)
+        self.assertGreater(events.index(verify), events.index(attest))
+
+    def test_attestation_failure_prevents_promotion_and_release(self):
+        for point in ("attest", "verify-attestation"):
+            with self.subTest(point=point):
+                result, events, _ = self.execute(self.manifest_scripts(), fail_at=point)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(any("example:v1.2.3" in event or "example:latest" in event for event in events))
+                self.assertFalse(any(event.startswith("gh release ") for event in events))
+
+    def test_standard_signing_signs_and_verifies_the_digest_for_the_caller_repository(self):
+        digest = "sha256:" + "a" * 64
+        result, events, _ = self.execute([
+            f"export DIGEST={digest}",
+            self.step_script("sign-manifest", "Sign and verify release manifest"),
+        ])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(events[0], f"cosign sign --yes ghcr.io/uug-ai/example@{digest}")
+        self.assertTrue(events[1].startswith("cosign verify "))
+        self.assertIn("--certificate-github-workflow-repository uug-ai/example", events[1])
+        self.assertTrue(events[1].endswith(f" ghcr.io/uug-ai/example@{digest}"))
+
+    def test_standard_signing_rejects_missing_or_malformed_digests(self):
+        for digest in ("", "v1.2.3", "sha256:abc", "sha256:" + "A" * 64):
+            with self.subTest(digest=digest):
+                result, events, _ = self.execute([
+                    f"export DIGEST='{digest}'",
+                    self.step_script("sign-manifest", "Sign and verify release manifest"),
+                ])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(events, [])
+
+    def test_standard_signing_failure_is_not_reported_as_success(self):
+        for point in ("sign", "verify"):
+            with self.subTest(point=point):
+                result, _, _ = self.execute([
+                    "export DIGEST=sha256:" + "b" * 64,
+                    self.step_script("sign-manifest", "Sign and verify release manifest"),
+                ], fail_at=point)
+                self.assertNotEqual(result.returncode, 0)
+
     def test_final_tags_and_github_publication_follow_verification(self):
         result, events, verified = self.execute(self.manifest_scripts())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1061,16 +1207,18 @@ esac
         self.assertNotIn("--draft=false", edit)
         self.assertIn("already published", result.stdout)
 
-    def test_release_notes_show_verified_or_standard_hardening_without_losing_notes(self):
-        for hardened, status in (
-            (True, "Verified (security checks, SBOM, provenance and signing)"),
-            (False, "Not verified (standard build)"),
+    def test_release_notes_show_verified_signed_or_standard_status_without_losing_notes(self):
+        for hardened, signed, status in (
+            (True, False, "Verified (security checks, SBOM, provenance and signing)"),
+            (True, True, "Verified (security checks, SBOM, provenance and signing)"),
+            (False, True, "Signed (standard build, not hardened)"),
+            (False, False, "Not verified (standard build)"),
         ):
-            with self.subTest(hardened=hardened):
+            with self.subTest(hardened=hardened, signed=signed):
                 notes = "## Changes\n\nOriginal notes, translations and [assets](https://example.com).\n"
                 result, events, _ = self.execute(
                     [self.finalization_script, "cat release-notes.md"],
-                    hardened=hardened, release_body=notes,
+                    hardened=hardened, signed=signed, release_body=notes,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"**Image hardening: {status}**", result.stdout)
