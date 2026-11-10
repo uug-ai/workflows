@@ -127,6 +127,88 @@ def validate_pr_description_action(errors: list[str]) -> None:
         errors.append("PR description workflow must use the first-party action")
 
 
+# A standard release that asked to be signed only counts as published once its
+# signature exists and verifies; hardened releases always sign before promotion.
+PUBLICATION_SUCCEEDED = (
+    "((needs.create-manifest.result == 'success' && "
+    "(!inputs.sign || needs.sign-manifest.result == 'success')) || "
+    "needs.hardened-manifest.result == 'success')"
+)
+SIGNER_IDENTITY_FLAG = (
+    "--certificate-identity-regexp "
+    "'^https://github\\.com/uug-ai/workflows/\\.github/workflows/release-create\\.yml@(refs/\\S+|[0-9a-f]{40})$'"
+)
+REPOSITORY_FLAG = '--certificate-github-workflow-repository "$GITHUB_REPOSITORY"'
+HARDENING_PREDICATE_TYPE = "https://github.com/uug-ai/workflows/attestations/image-hardening/v1"
+
+
+def verifies_signer_and_repository(script: str, command: str) -> bool:
+    """Every cosign verification must pin both the signing workflow and the caller repository."""
+    blocks = script.split(command)[1:]
+    return bool(blocks) and all(
+        SIGNER_IDENTITY_FLAG in block.split('"$IMAGE@')[0]
+        and REPOSITORY_FLAG in block.split('"$IMAGE@')[0]
+        and "--certificate-oidc-issuer https://token.actions.githubusercontent.com" in block.split('"$IMAGE@')[0]
+        for block in blocks
+    )
+
+
+def validate_standard_signing(data: dict, errors: list[str]) -> None:
+    inputs = data["on"]["workflow_call"]["inputs"]
+    if inputs.get("sign", {}).get("default") is not False:
+        errors.append("release-create.yml: standard signing must remain opt-in for callers without OIDC")
+    jobs = data["jobs"]
+    if jobs["create-manifest"].get("outputs", {}).get("digest") != "${{ steps.manifest.outputs.digest }}":
+        errors.append("release-create.yml: standard manifests must expose the pushed digest")
+    signer = jobs.get("sign-manifest")
+    if not signer:
+        errors.append("release-create.yml: standard releases require an opt-in signing job")
+        return
+    if signer.get("needs") != "create-manifest" or signer.get("if") != (
+        "${{ !inputs.hardened && inputs.publish && inputs.sign }}"
+    ):
+        errors.append("release-create.yml: standard signing must follow manifest publication and stay opt-in")
+    if "permissions" in signer:
+        errors.append("release-create.yml: standard signing must inherit the caller's optional OIDC grant")
+    step = next(
+        (step for step in signer["steps"] if step.get("name") == "Sign and verify release manifest"), {},
+    )
+    script = step.get("run", "")
+    if step.get("env", {}).get("DIGEST") != "${{ needs.create-manifest.outputs.digest }}":
+        errors.append("release-create.yml: standard signing must sign the pushed manifest digest")
+    if 'cosign sign --yes "$IMAGE@$DIGEST"' not in script or ":$TAG" in script or ":latest" in script:
+        errors.append("release-create.yml: standard signing must sign by digest, never by tag")
+    if not verifies_signer_and_repository(script, "cosign verify "):
+        errors.append("release-create.yml: standard signatures must be verified for the workflow and caller repository")
+
+
+def validate_hardening_attestation(manifest_steps: list, errors: list[str]) -> None:
+    names = [step.get("name") for step in manifest_steps]
+    assemble = "Assemble and verify staged multi-platform manifest"
+    attest = "Attest and verify hardening result"
+    promote = "Promote verified image tags"
+    if any(name not in names for name in (assemble, attest, promote)) or not (
+        names.index(assemble) < names.index(attest) < names.index(promote)
+    ):
+        errors.append("release-create.yml: hardening attestation must follow signing and precede promotion")
+        return
+    signing = manifest_steps[names.index(assemble)].get("run", "")
+    if not verifies_signer_and_repository(signing, "cosign verify "):
+        errors.append("release-create.yml: hardened signatures must be verified for the workflow and caller repository")
+    step = manifest_steps[names.index(attest)]
+    script = step.get("run", "")
+    if step.get("env", {}).get("PREDICATE_TYPE") != HARDENING_PREDICATE_TYPE:
+        errors.append("release-create.yml: hardening attestations must use the published predicate type")
+    if (
+        'digest=$(cat verified-digest.txt)' not in script
+        or 'cosign attest --yes --type "$PREDICATE_TYPE"' not in script
+        or ":$TAG" in script or ":latest" in script
+    ):
+        errors.append("release-create.yml: hardening attestations must target the verified digest")
+    if not verifies_signer_and_repository(script, 'cosign verify-attestation --type "$PREDICATE_TYPE" '):
+        errors.append("release-create.yml: hardening attestations must be verified for the workflow and caller repository")
+
+
 def validate_release_workflow(data: dict, errors: list[str]) -> None:
     inputs = data["on"]["workflow_call"]["inputs"]
     if inputs["hardened"]["default"] is not False:
@@ -450,22 +532,24 @@ def validate_release_workflow(data: dict, errors: list[str]) -> None:
         or min(evidence_indexes) <= manifest_names.index(required_manifest_order[1])
     ):
         errors.append("release-create.yml: promotion must precede release evidence upload")
+    validate_hardening_attestation(manifest_steps, errors)
+    validate_standard_signing(data, errors)
     finalization = jobs["finalize-release"]
-    if finalization["needs"] != ["create-manifest", "hardened-manifest"]:
+    if finalization["needs"] != ["create-manifest", "sign-manifest", "hardened-manifest"]:
         errors.append("release-create.yml: release finalization must wait for manifest publication and evidence")
     if finalization["if"] != (
         "${{ always() && !cancelled() && inputs.finalize_release && inputs.publish && "
-        "(needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}"
+        f"{PUBLICATION_SUCCEEDED} }}}}"
     ):
         errors.append("release-create.yml: GitHub release finalization must require opt-in and successful publication")
     if "permissions" in finalization:
         errors.append("release-create.yml: optional finalization must inherit caller permissions")
     promotion = jobs["update-gitops"]
-    if promotion["needs"] != ["create-manifest", "hardened-manifest", "finalize-release"]:
+    if promotion["needs"] != ["create-manifest", "sign-manifest", "hardened-manifest", "finalize-release"]:
         errors.append("release-create.yml: GitOps must wait for manifest publication and release finalization")
     if promotion["if"] != (
         "${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && "
-        "(needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') && "
+        f"{PUBLICATION_SUCCEEDED} && "
         "(needs.finalize-release.result == 'success' || needs.finalize-release.result == 'skipped') }}"
     ):
         errors.append("release-create.yml: GitOps must require successful publication")

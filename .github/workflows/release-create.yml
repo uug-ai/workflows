@@ -26,6 +26,10 @@ on:
         description: 'Enforce the non-root /app/main Go worker image contract, tests, scans, provenance and signing'
         type: boolean
         default: false
+      sign:
+        description: 'Keyless-sign standard (non-hardened) release manifests; the caller must grant id-token: write. Hardened releases are always signed'
+        type: boolean
+        default: false
       hardened_profile:
         description: 'Runtime contract: worker, frontend, api, standalone, or mongo-task'
         type: string
@@ -245,6 +249,8 @@ jobs:
       packages: write
     runs-on: ubuntu-24.04
     needs: [build]
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
     steps:
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -255,8 +261,10 @@ jobs:
       - name: Wait for image propagation
         run: sleep 10
       - name: Create and push manifests
+        id: manifest
         shell: bash
         run: |
+          set -euo pipefail
           mapfile -t image_refs < <(python3 - <<'PY'
           import json
           import os
@@ -274,6 +282,53 @@ jobs:
             docker manifest create "ghcr.io/$ORGANIZATION/$PROJECT:latest" "${image_refs[@]}"
             docker manifest push "ghcr.io/$ORGANIZATION/$PROJECT:latest"
           fi
+
+          digest=$(docker buildx imagetools inspect "ghcr.io/$ORGANIZATION/$PROJECT:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not resolve the pushed manifest digest for $TAG"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  # Standard releases are signed only on request: signing needs the caller's
+  # id-token: write grant, which this job inherits rather than declares, so
+  # callers without OIDC keep working while sign is false.
+  sign-manifest:
+    if: ${{ !inputs.hardened && inputs.publish && inputs.sign }}
+    needs: create-manifest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.2
+      - name: Sign and verify release manifest
+        env:
+          IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}
+          DIGEST: ${{ needs.create-manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Release manifest digest is missing or malformed"
+            exit 1
+          fi
+          cosign sign --yes "$IMAGE@$DIGEST"
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/uug-ai/workflows/\.github/workflows/release-create\.yml@(refs/\S+|[0-9a-f]{40})$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            "$IMAGE@$DIGEST" > signature-verification.json
+          echo "$IMAGE@$DIGEST" | tee image-digest.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_prefix }}-signature
+          path: |
+            image-digest.txt
+            signature-verification.json
 
   hardened-source:
     if: inputs.hardened
@@ -780,7 +835,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.2
       - name: Assemble and verify staged multi-platform manifest
         env:
           IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}
@@ -800,9 +857,54 @@ jobs:
           cosign verify \
             --certificate-identity-regexp '^https://github\.com/uug-ai/workflows/\.github/workflows/release-create\.yml@(refs/\S+|[0-9a-f]{40})$' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
             "$IMAGE@$digest" > signature-verification.json
           printf '%s\n' "$digest" > verified-digest.txt
           echo "$IMAGE@$digest" | tee image-digest.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Attest and verify hardening result
+        env:
+          IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}
+          PROFILE: ${{ inputs.hardened_profile }}
+          PREDICATE_TYPE: https://github.com/uug-ai/workflows/attestations/image-hardening/v1
+        run: |
+          set -euo pipefail
+          digest=$(cat verified-digest.txt)
+          platforms='{}'
+          for file in digest-*.txt; do
+            test -f "$file"
+            architecture=${file#digest-}
+            architecture=${architecture%.txt}
+            platforms=$(jq -c --arg arch "$architecture" --arg digest "$(cat "$file")" '. + {($arch): $digest}' <<< "$platforms")
+          done
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg tag "$TAG" \
+            --arg profile "$PROFILE" \
+            --arg run "${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+            --argjson platforms "$platforms" \
+            '{
+              result: "passed",
+              repository: $repository,
+              tag: $tag,
+              profile: $profile,
+              run: $run,
+              platforms: $platforms,
+              checks: [
+                "source-secret-and-misconfiguration-scan",
+                "native-tests-race-and-govulncheck",
+                "non-root-runtime-contract",
+                "read-only-no-capability-smoke-test",
+                "image-vulnerability-and-secret-gate",
+                "sbom-package-inventory-match",
+                "published-digest-rescan"
+              ]
+            }' > hardening-predicate.json
+          cosign attest --yes --type "$PREDICATE_TYPE" --predicate hardening-predicate.json "$IMAGE@$digest"
+          cosign verify-attestation --type "$PREDICATE_TYPE" \
+            --certificate-identity-regexp '^https://github\.com/uug-ai/workflows/\.github/workflows/release-create\.yml@(refs/\S+|[0-9a-f]{40})$' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            "$IMAGE@$digest" > attestation-verification.json
       - name: Promote verified image tags
         env:
           IMAGE: ghcr.io/${{ env.ORGANIZATION }}/${{ env.PROJECT }}
@@ -837,15 +939,18 @@ jobs:
             manifest.json
             image-digest.txt
             signature-verification.json
+            hardening-predicate.json
+            attestation-verification.json
   finalize-release:
-    needs: [create-manifest, hardened-manifest]
-    if: ${{ always() && !cancelled() && inputs.finalize_release && inputs.publish && (needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') }}
+    needs: [create-manifest, sign-manifest, hardened-manifest]
+    if: ${{ always() && !cancelled() && inputs.finalize_release && inputs.publish && ((needs.create-manifest.result == 'success' && (!inputs.sign || needs.sign-manifest.result == 'success')) || needs.hardened-manifest.result == 'success') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Record hardening status and finalize GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           HARDENED: ${{ inputs.hardened }}
+          SIGNED: ${{ inputs.sign }}
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body,isDraft > release.json
@@ -871,11 +976,12 @@ jobs:
               exit 1
               ;;
           esac
-          case "$HARDENED" in
-            true) status='Verified (security checks, SBOM, provenance and signing)' ;;
-            false) status='Not verified (standard build)' ;;
+          case "$HARDENED:$SIGNED" in
+            true:true|true:false) status='Verified (security checks, SBOM, provenance and signing)' ;;
+            false:true) status='Signed (standard build, not hardened)' ;;
+            false:false) status='Not verified (standard build)' ;;
             *)
-              echo "::error::Unexpected image hardening state: $HARDENED"
+              echo "::error::Unexpected image hardening state: $HARDENED/$SIGNED"
               exit 1
               ;;
           esac
@@ -892,8 +998,8 @@ jobs:
       contents: read
       packages: write
     runs-on: ubuntu-24.04
-    needs: [create-manifest, hardened-manifest, finalize-release]
-    if: ${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && (needs.create-manifest.result == 'success' || needs.hardened-manifest.result == 'success') && (needs.finalize-release.result == 'success' || needs.finalize-release.result == 'skipped') }}
+    needs: [create-manifest, sign-manifest, hardened-manifest, finalize-release]
+    if: ${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && ((needs.create-manifest.result == 'success' && (!inputs.sign || needs.sign-manifest.result == 'success')) || needs.hardened-manifest.result == 'success') && (needs.finalize-release.result == 'success' || needs.finalize-release.result == 'skipped') }}
     steps:
       - name: Get source release notes
         id: release-notes
