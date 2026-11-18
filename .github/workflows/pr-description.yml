@@ -40,7 +40,7 @@ env:
   
 jobs:
   openai-pr-description:
-    runs-on: ubuntu-22.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-22.04' }}
     permissions:
       pull-requests: write
 

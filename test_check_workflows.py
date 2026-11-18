@@ -10,11 +10,70 @@ import tarfile
 import unittest
 
 from check_workflows import (
+    EXPECTED_WORKFLOWS,
     WORKFLOWS_DIR,
     load_yaml,
     validate_release_bump_workflow,
     validate_release_workflow,
 )
+
+
+class RunnerSelectionTest(unittest.TestCase):
+    MATRIX_DEFAULT = (
+        '[{"architecture":"amd64","runner":"ubuntu-24.04"},'
+        '{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]'
+    )
+    MATRIX_SELECTION = (
+        "inputs.runner_matrix || "
+        "(github.event.repository.private && vars.ACTIONS_RUNNER_MATRIX) || "
+        f"'{MATRIX_DEFAULT}'"
+    )
+
+    def test_all_non_matrix_jobs_use_private_repository_variable_and_original_default(self):
+        defaults = {
+            "issue-userstory-create.yml": "ubuntu-latest",
+            "pr-build.yml": None,
+            "pr-delete-environment.yml": "ubuntu-latest",
+            "pr-description.yml": "ubuntu-22.04",
+            "pr-update-environment.yml": "ubuntu-24.04",
+            "release-bump.yml": "ubuntu-latest",
+            "release-create.yml": "ubuntu-24.04",
+            "security-scan.yml": "ubuntu-latest",
+            "test-coverage.yaml": "ubuntu-latest",
+        }
+        self.assertEqual(set(defaults), EXPECTED_WORKFLOWS)
+        for filename, default in defaults.items():
+            workflow = load_yaml(WORKFLOWS_DIR / filename)
+            for name, job in workflow["jobs"].items():
+                with self.subTest(workflow=filename, job=name):
+                    if "strategy" in job:
+                        self.assertEqual(job["runs-on"], "${{ matrix.runner }}")
+                    else:
+                        self.assertIsNotNone(default)
+                        self.assertEqual(
+                            job["runs-on"],
+                            "${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || "
+                            f"'{default}'" + " }}",
+                        )
+
+    def test_all_native_matrices_honor_explicit_input_before_private_variable_and_defaults(self):
+        for filename in ("pr-build.yml", "release-create.yml"):
+            workflow = load_yaml(WORKFLOWS_DIR / filename)
+            with self.subTest(workflow=filename):
+                self.assertEqual(
+                    workflow["on"]["workflow_call"]["inputs"]["runner_matrix"]["default"], "",
+                )
+                for job in workflow["jobs"].values():
+                    if "strategy" in job:
+                        self.assertEqual(
+                            job["strategy"]["matrix"]["include"],
+                            "${{ fromJson(" + self.MATRIX_SELECTION + ") }}",
+                        )
+                if filename == "release-create.yml":
+                    self.assertEqual(
+                        workflow["env"]["RUNNER_MATRIX"],
+                        "${{ " + self.MATRIX_SELECTION + " }}",
+                    )
 
 
 class ReleaseContractsTest(unittest.TestCase):

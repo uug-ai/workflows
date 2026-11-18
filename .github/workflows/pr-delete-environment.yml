@@ -58,7 +58,7 @@ env:
   
 jobs:
   update-gitops-environment:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-latest' }}
     steps:
       - name: Update GitOps Pull Request environment
         uses: cedricve/gitops-pullrequest-environment@main

@@ -89,7 +89,7 @@ env:
 jobs:
   image-build:
     name: Build container image
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-24.04' }}
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - name: Checkout repository
@@ -123,7 +123,7 @@ jobs:
 
   format:
     name: Print Pull Request Info
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-24.04' }}
     needs: image-build
     steps:
       # Print out the pull request event type
@@ -133,7 +133,7 @@ jobs:
 
   update-pr-environment:
     name: Update Pull Request environment in GitOps repo
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-24.04' }}
     needs: format
     steps:
       # After we build the Docker image, we create a pull request to update the GitOps repository
