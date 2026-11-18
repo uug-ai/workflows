@@ -61,7 +61,7 @@ env:
 
 jobs:
   test-coverage:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-latest' }}
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:

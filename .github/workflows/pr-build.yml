@@ -57,10 +57,10 @@ on:
         type: string
         default: '.'
       runner_matrix:
-        description: 'JSON array of objects with architecture and runner keys'
+        description: 'JSON array of architecture/runner objects; empty uses private-repo ACTIONS_RUNNER_MATRIX or the native amd64/arm64 defaults'
         required: false
         type: string
-        default: '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]'
+        default: ''
     secrets:
       USERNAME:
         required: false
@@ -86,7 +86,7 @@ jobs:
       packages: read
     strategy:
       matrix:
-        include: ${{ fromJson(inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]') }}
+        include: ${{ fromJson(inputs.runner_matrix || (github.event.repository.private && vars.ACTIONS_RUNNER_MATRIX) || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

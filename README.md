@@ -15,6 +15,53 @@ jobs:
 
 To pin to a version, replace `@main` with a tag such as `@v1.0.0`.
 
+## Repository-level runner selection
+
+Private calling repositories can select runners without editing their wrapper
+workflows. In **Settings > Secrets and variables > Actions > Variables**, set:
+
+| Variable | Value | Applies to |
+| --- | --- | --- |
+| `ACTIONS_RUNNER` | `bijlokehof` | Non-matrix jobs in all reusable workflows |
+| `ACTIONS_RUNNER_MATRIX` | `[{"architecture":"amd64","runner":"bijlokehof"}]` | Native build jobs in `pr-build.yml` and `release-create.yml` |
+
+These are configuration variables, not secrets. They can also be organization
+variables scoped to selected private repositories. GitHub resolves them from the
+calling repository, not this shared repository. Callers must reference a revision
+containing this support; older pinned tags or commits do not gain it automatically.
+
+Non-matrix jobs use `ACTIONS_RUNNER` only when the calling repository is private;
+otherwise each job retains its original hosted runner label. Matrix selection uses
+an explicit non-empty `with.runner_matrix` first, then a private repository's
+`ACTIONS_RUNNER_MATRIX`, then the original native amd64/arm64 matrix. The same
+resolved matrix is used for standard builds, hardened builds, and release manifest
+assembly. `ACTIONS_RUNNER` alone does not override native matrix builds, and there
+is no automatic fallback to hosted runners when a selected runner is unavailable.
+Invalid matrix JSON fails workflow evaluation instead of silently changing targets.
+Public repositories ignore both variables, but retain support for explicit matrix
+inputs. Runner-group access must still permit the caller; variables do not grant it.
+
+**Do not enable these variables for Docker workflows on the current Bijlokehof
+runner image yet.** Those runners are amd64, non-privileged, and have no Docker
+daemon. The image is not the full GitHub-hosted Ubuntu toolchain. Docker builds,
+Buildx, service containers, container actions, native smoke tests, Python-based
+actions, Go/race builds, and any privileged tool installation must be validated on
+the chosen runner image before routing jobs. Setting an amd64-only matrix also
+intentionally drops ARM64 output; retain a separate ARM64 runner entry if required.
+Keep untrusted PR code off production nodes even in private repositories.
+
+For these existing Docker workflows, prefer ephemeral runners in dedicated CI VMs
+or a separate CI cluster. They need a compatible Docker daemon plus Buildx,
+Compose where required, writable work/tool-cache directories, Bash, Git, curl,
+CA certificates, jq, Python 3, archive utilities, and a C/C++ toolchain for Go race
+tests. Use setup actions for project-specific Go/Node versions. Existing scripts
+also use `sudo`; either adapt those installations to user-writable paths or confine
+that privilege to the isolated CI environment. Native ARM64 jobs need ARM64
+capacity. A remote build-only BuildKit service is not a drop-in replacement:
+the release workflows also use `docker run`, service-container ports, bind
+mounts, and host networking. Do not mount the production host's Docker socket or
+enable privileged Docker-in-Docker on shared production nodes.
+
 ## General calling pattern
 
 Create a small wrapper workflow in the consuming repository and forward the event-specific values as inputs.

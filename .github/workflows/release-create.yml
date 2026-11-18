@@ -96,10 +96,10 @@ on:
         type: boolean
         default: false
       runner_matrix:
-        description: 'JSON array of objects with architecture and runner keys'
+        description: 'JSON array of architecture/runner objects; empty uses private-repo ACTIONS_RUNNER_MATRIX or the native amd64/arm64 defaults'
         required: false
         type: string
-        default: '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]'
+        default: ''
       create_gitops_pr:
         description: 'Whether to create a GitOps pull request after publishing images'
         required: false
@@ -157,7 +157,7 @@ env:
   TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
   LATEST: ${{ inputs.latest }}
   BUILD_CONTEXT: ${{ inputs.docker_context || '.' }}
-  RUNNER_MATRIX: ${{ inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]' }}
+  RUNNER_MATRIX: ${{ inputs.runner_matrix || (github.event.repository.private && vars.ACTIONS_RUNNER_MATRIX) || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]' }}
   GITOPS_REPO: ${{ inputs.gitops_repo || 'uug-ai/gitops' }}
   GITOPS_FILE: ${{ inputs.gitops_file || 'environments/staging/kerberos-hub/values.yaml' }}
   GITOPS_KEY: ${{ inputs.gitops_key || 'kerberoshub.api.tag' }}
@@ -177,7 +177,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        include: ${{ fromJson(inputs.runner_matrix || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]') }}
+        include: ${{ fromJson(inputs.runner_matrix || (github.event.repository.private && vars.ACTIONS_RUNNER_MATRIX) || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -247,7 +247,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-24.04' }}
     needs: [build]
     outputs:
       digest: ${{ steps.manifest.outputs.digest }}
@@ -296,7 +296,7 @@ jobs:
   sign-manifest:
     if: ${{ !inputs.hardened && inputs.publish && inputs.sign }}
     needs: create-manifest
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-24.04' }}
     steps:
       - uses: docker/login-action@v3
         with:
@@ -334,7 +334,7 @@ jobs:
     if: inputs.hardened
     permissions:
       contents: read
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -440,7 +440,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(inputs.runner_matrix) }}
+        include: ${{ fromJson(inputs.runner_matrix || (github.event.repository.private && vars.ACTIONS_RUNNER_MATRIX) || '[{"architecture":"amd64","runner":"ubuntu-24.04"},{"architecture":"arm64","runner":"sh-ubuntu-24.04-arm"}]') }}
     runs-on: ${{ matrix.runner }}
     services:
       mongodb:
@@ -823,7 +823,7 @@ jobs:
   hardened-manifest:
     if: inputs.hardened && inputs.publish
     needs: hardened-images
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-24.04' }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -944,7 +944,7 @@ jobs:
   finalize-release:
     needs: [create-manifest, sign-manifest, hardened-manifest]
     if: ${{ always() && !cancelled() && inputs.finalize_release && inputs.publish && ((needs.create-manifest.result == 'success' && (!inputs.sign || needs.sign-manifest.result == 'success')) || needs.hardened-manifest.result == 'success') }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-24.04' }}
     steps:
       - name: Record hardening status and finalize GitHub release
         env:
@@ -997,7 +997,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-24.04' }}
     needs: [create-manifest, sign-manifest, hardened-manifest, finalize-release]
     if: ${{ always() && !cancelled() && inputs.create_gitops_pr && inputs.publish && ((needs.create-manifest.result == 'success' && (!inputs.sign || needs.sign-manifest.result == 'success')) || needs.hardened-manifest.result == 'success') && (needs.finalize-release.result == 'success' || needs.finalize-release.result == 'skipped') }}
     steps:
