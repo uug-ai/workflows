@@ -60,7 +60,36 @@ jobs:
   update-gitops-environment:
     runs-on: ${{ (github.event.repository.private && vars.ACTIONS_RUNNER) || 'ubuntu-latest' }}
     steps:
+      # Most PRs never get a preview environment (callers gate the update job,
+      # e.g. on a label). Deleting one that does not exist leaves nothing to
+      # commit, and the action's `git commit` then fails the job.
+      - name: Check for a pull request environment
+        id: environment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          OVERLAY_PATH: pullrequests/${{ env.PROJECT }}/overlays/${{ env.GITOPS_PR_ENVIRONMENT }}
+        run: |
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITOPS_REPO}/contents/${OVERLAY_PATH}?ref=main")
+          case "$status" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              echo "No pull request environment at ${GITOPS_REPO}/${OVERLAY_PATH}; nothing to delete."
+              ;;
+            *)
+              echo "::error::Could not check ${GITOPS_REPO}/${OVERLAY_PATH} (HTTP ${status})"
+              exit 1
+              ;;
+          esac
+
       - name: Update GitOps Pull Request environment
+        if: ${{ steps.environment.outputs.exists == 'true' }}
         uses: cedricve/gitops-pullrequest-environment@main
         with:
           action: ${{ env.PR_ACTION }}
